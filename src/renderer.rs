@@ -1031,7 +1031,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "treader-invalid-{}-{}-{}.{}",
+            "kitpdf-invalid-{}-{}-{}.{}",
             std::process::id(),
             unique,
             contents.len(),

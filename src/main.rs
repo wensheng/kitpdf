@@ -1,4 +1,4 @@
-// treader — terminal PDF viewer using the Kitty graphics protocol
+// kitpdf — terminal PDF viewer using the Kitty graphics protocol
 // Architecture:
 //   Main thread: async event loop (tokio) — input, display, orchestration
 //   Render thread: blocking std::thread — mupdf PDF→pixmap (mupdf is !Send)
@@ -128,7 +128,7 @@ async fn inner_main() -> anyhow::Result<()> {
     let _logger = if std::env::var("RUST_LOG").is_ok() {
         Some(
             flexi_logger::Logger::try_with_env()?
-                .log_to_file(flexi_logger::FileSpec::try_from("./treader.log")?)
+                .log_to_file(flexi_logger::FileSpec::try_from("./kitpdf.log")?)
                 .start()?,
         )
     } else {
@@ -150,7 +150,7 @@ async fn inner_main() -> anyhow::Result<()> {
                 return Ok(());
             }
             "--version" => {
-                println!("treader {}", env!("CARGO_PKG_VERSION"));
+                println!("kitpdf {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
             "-b" | "--black-color" => {
@@ -167,13 +167,13 @@ async fn inner_main() -> anyhow::Result<()> {
                 file_path = Some(PathBuf::from(s));
             }
             other => {
-                anyhow::bail!("unknown argument: {other}\nUsage: treader [options] <file>");
+                anyhow::bail!("unknown argument: {other}\nUsage: kitpdf [options] <file>");
             }
         }
     }
 
     let path = file_path
-        .ok_or_else(|| anyhow::anyhow!("Usage: treader [options] <file>"))?
+        .ok_or_else(|| anyhow::anyhow!("Usage: kitpdf [options] <file>"))?
         .canonicalize()?;
 
     preflight_document(&path)?;
@@ -1507,10 +1507,10 @@ fn open_url(url: &str) {
 fn print_usage() {
     println!(
         "\
-treader {} — terminal PDF/EPUB viewer (Kitty graphics protocol)
+kitpdf {} — terminal PDF/EPUB viewer (Kitty graphics protocol)
 
 USAGE:
-    treader [options] <file>
+    kitpdf [options] <file>
 
 ARGUMENTS:
     <file>                    PDF or EPUB file to open
@@ -1547,7 +1547,7 @@ KEYBOARD:
     q, Esc                   Quit
 
 ENVIRONMENT:
-    RUST_LOG=debug            Enable debug logging to ./treader.log
+    RUST_LOG=debug            Enable debug logging to ./kitpdf.log
 
 See docs/help.md for the full reference.",
         env!("CARGO_PKG_VERSION")

@@ -1,6 +1,9 @@
 // State persistence — save/load per-file viewer state to XDG cache.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fmt::Write as _,
+    path::{Path, PathBuf},
+};
 
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
@@ -17,12 +20,15 @@ pub struct SavedState {
 }
 
 fn state_path(file_path: &Path) -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "treader")?;
+    let dirs = directories::ProjectDirs::from("", "", "kitpdf")?;
     let cache = dirs.cache_dir();
-    std::fs::create_dir_all(cache).ok()?;
 
     let hash = Md5::digest(file_path.to_string_lossy().as_bytes());
-    let name = format!("{:x}.json", hash);
+    let mut name = String::with_capacity(hash.as_slice().len() * 2 + ".json".len());
+    for byte in hash.as_slice() {
+        write!(&mut name, "{byte:02x}").ok()?;
+    }
+    name.push_str(".json");
     Some(cache.join(name))
 }
 
@@ -34,6 +40,9 @@ pub fn load_state(file_path: &Path) -> Option<SavedState> {
 
 pub fn save_state(file_path: &Path, state: &SavedState) {
     if let Some(path) = state_path(file_path) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         if let Ok(data) = serde_json::to_string(state) {
             let _ = std::fs::write(path, data);
         }
@@ -101,9 +110,18 @@ mod tests {
     }
 
     #[test]
+    fn state_path_file_name_is_lowercase_md5_json() {
+        let path = state_path(Path::new("/some/test/file.pdf")).unwrap();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        let hash = name.strip_suffix(".json").unwrap();
+        assert_eq!(hash.len(), 32);
+        assert!(hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+    }
+
+    #[test]
     fn save_and_load_round_trip() {
         // Use a temp directory to avoid polluting the real cache
-        let tmp = std::env::temp_dir().join("treader_test_state");
+        let tmp = std::env::temp_dir().join("kitpdf_test_state");
         std::fs::create_dir_all(&tmp).ok();
         let fake_path = tmp.join("test_doc.pdf");
 

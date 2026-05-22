@@ -3,7 +3,7 @@
 
 use std::{
     collections::HashMap,
-    num::NonZeroUsize,
+    num::{NonZeroU32, NonZeroUsize},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -11,7 +11,7 @@ use std::{
 use flume::{Receiver, SendError, Sender, TryRecvError};
 use futures_util::stream::StreamExt as _;
 use image::{DynamicImage, RgbImage};
-use kittage::{ImageId, NumberOrId, action::NONZERO_ONE};
+use kittage::{ImageId, NumberOrId};
 use rayon::prelude::*;
 
 use crate::{
@@ -550,7 +550,7 @@ fn convert_page_info(
         % 1_000_000;
 
     let mut img = if shms_work {
-        let shm_name = format!("/treader_{pid}_{rn}_{page_num}");
+        let shm_name = format!("/kitpdf_{pid}_{rn}_{page_num}");
         #[cfg(unix)]
         let shm_name = &*shm_name;
         kittage::image::Image::shm_from(DynamicImage::ImageRgb8(final_img), shm_name)
@@ -560,7 +560,7 @@ fn convert_page_info(
     };
 
     // Assign a stable per-page ID (1-indexed since 0 is invalid).
-    img.num_or_id = NumberOrId::Id(NONZERO_ONE.saturating_add(page_num as u32));
+    img.num_or_id = NumberOrId::Id(NonZeroU32::new(1).unwrap().saturating_add(page_num as u32));
 
     Ok(ConvertedPage {
         page_num,

@@ -7,11 +7,11 @@ use std::time::Duration;
 use crossterm::{cursor::MoveTo, event::EventStream, execute};
 use image::DynamicImage;
 use kittage::{
-    AsyncInputReader, ImageDimensions, ImageId, NumberOrId, PixelFormat,
+    AsyncInputReader, IdentifierType, ImageDimensions, ImageId, NumberOrId, PixelFormat,
     action::Action,
     delete::{ClearOrDelete, DeleteConfig, WhichToDelete},
     display::{CursorMovementPolicy, DisplayConfig, DisplayLocation},
-    error::TransmitError,
+    error::{ParseError, TransmitError},
     event_stream::InputErr,
     image::Image,
     medium::Medium,
@@ -111,7 +111,7 @@ impl AsyncInputReader for &mut MinTimeoutStream<'_> {
 pub async fn run_action(
     action: Action<'_, '_>,
     ev_stream: &mut EventStream,
-) -> Result<ImageId, TransmitError<InputErr>> {
+) -> Result<Option<ImageId>, TransmitError<InputErr>> {
     let writer = DbgWriter {
         w: std::io::stdout().lock(),
         #[cfg(debug_assertions)]
@@ -127,6 +127,12 @@ pub async fn run_action(
         .map(|(_, id)| id)
 }
 
+fn missing_image_id_error() -> TransmitError<InputErr> {
+    TransmitError::ParsingResponse(ParseError::NoResponseId {
+        ty: IdentifierType::ImageId,
+    })
+}
+
 /// Test whether the terminal supports the Kitty graphics protocol at all.
 pub async fn supports_kitty_graphics(ev_stream: &mut EventStream) -> bool {
     let mut img: Image<'static> = DynamicImage::new_rgb8(1, 1).into();
@@ -139,7 +145,7 @@ pub async fn supports_kitty_graphics(ev_stream: &mut EventStream) -> bool {
 pub async fn do_shms_work(ev_stream: &mut EventStream) -> bool {
     let img = DynamicImage::new_rgb8(1, 1);
     let pid = std::process::id();
-    let shm_name = format!("treader_test_{pid}");
+    let shm_name = format!("kitpdf_test_{pid}");
 
     #[cfg(unix)]
     let shm_name = &*shm_name;
@@ -221,10 +227,11 @@ pub async fn display_kitty_images(
                 )
                 .await
                 {
-                    Ok(img_id) => {
+                    Ok(Some(img_id)) => {
                         *img = MaybeTransferred::Transferred(img_id);
                         Ok(())
                     }
+                    Ok(None) => Err((page_num, missing_image_id_error())),
                     Err(e) => Err((page_num, e)),
                 }
             }
