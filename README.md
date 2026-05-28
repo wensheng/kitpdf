@@ -31,6 +31,8 @@ kitpdf [options] <file.pdf|epub>
 
 | Flag | Description |
 |------|-------------|
+| `-p`, `--page <N>` | Start on page N (1-indexed; ignores saved page position) |
+| `-e`, `--export` | Export one page to PNG and exit (uses `--page` when provided, otherwise page 1) |
 | `-i`, `--invert` | Start with inverted colours |
 | `-b`, `--black-color <color>` | Custom black colour (CSS colour string) |
 | `-w`, `--white-color <color>` | Custom white colour (CSS colour string) |
@@ -41,6 +43,8 @@ kitpdf [options] <file.pdf|epub>
 
 ```
 kitpdf document.pdf
+kitpdf -p 12 document.pdf
+kitpdf --export -p 3 paper.pdf
 kitpdf --invert paper.pdf
 kitpdf -b '#1a1a2e' -w '#e0e0e0' book.epub
 ```
@@ -112,6 +116,7 @@ sharp at any zoom level.
 |-----|--------|
 | `M` | Show document metadata |
 | `f` | Show links on current page |
+| `e` | Export current page to PNG |
 | `?` | Help |
 
 When viewing links, type a number and press `Enter` to follow. Internal

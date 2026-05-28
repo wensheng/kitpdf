@@ -1,6 +1,12 @@
 // Blocking PDF render thread.
 
-use std::{collections::VecDeque, num::NonZeroUsize, path::Path, thread::sleep, time::Duration};
+use std::{
+    collections::VecDeque,
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+    thread::sleep,
+    time::Duration,
+};
 
 use flume::{Receiver, SendError, Sender, TryRecvError};
 use mupdf::{
@@ -8,7 +14,12 @@ use mupdf::{
     text_page::SearchHitResponse,
 };
 
-use crate::{error::RenderError, image_pipeline::InterleavedAroundWithMax, perf};
+use crate::{
+    error::RenderError,
+    export,
+    image_pipeline::{self, InterleavedAroundWithMax},
+    perf,
+};
 
 pub const MUPDF_BLACK: i32 = 0;
 pub const MUPDF_WHITE: i32 = i32::from_be_bytes([0, 0xff, 0xff, 0xff]);
@@ -50,6 +61,12 @@ pub enum RenderNotif {
     Refresh,
     /// Request links for a page (one-shot query).
     GetLinks(usize),
+    /// Export a page to a PNG file (one-shot query).
+    ExportPage {
+        page_num: usize,
+        output_path: PathBuf,
+        auto_crop: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,10 +80,17 @@ pub enum RenderInfo {
     EpubFontSize(f32),
     NumPages(usize),
     Page(PageInfo),
-    SearchResults { page_num: usize, num_results: usize },
+    SearchResults {
+        page_num: usize,
+        num_results: usize,
+    },
     Toc(Vec<TocEntry>),
     Metadata(Vec<(String, String)>),
     Links(Vec<LinkInfo>),
+    Exported {
+        page_num: usize,
+        output_path: PathBuf,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +157,17 @@ pub enum RotateDirection {
     Deg90,
     Deg180,
     Deg270,
+}
+
+impl RotateDirection {
+    fn from_degrees(degrees: u16) -> Self {
+        match degrees % 360 {
+            90 => Self::Deg90,
+            180 => Self::Deg180,
+            270 => Self::Deg270,
+            _ => Self::Deg0,
+        }
+    }
 }
 
 pub fn fill_default<T: Default>(vec: &mut Vec<T>, size: usize) {
@@ -283,6 +318,7 @@ pub fn start_rendering(
                         break area;
                     }
                     Ok(RenderNotif::GetLinks(_)) => {}
+                    Ok(RenderNotif::ExportPage { .. }) => {}
                     Ok(RenderNotif::AdjustFontSize(delta)) => {
                         if let Some(em) = reflow_em.as_mut() {
                             *em = adjust_epub_em(*em, delta);
@@ -535,12 +571,52 @@ pub fn start_rendering(
                             }
                             continue 'render_pages;
                         }
-                        // One-shot queries handled before this macro; unreachable here.
+                        RenderNotif::ExportPage {
+                            page_num,
+                            output_path,
+                            auto_crop,
+                        } => {
+                            let page_num = page_num.min(n_pages.get().saturating_sub(1));
+                            match export_loaded_page(
+                                &doc,
+                                &rendered,
+                                page_num,
+                                search_term.as_deref(),
+                                invert,
+                                black,
+                                white,
+                                tinted,
+                                rotate,
+                                (area_w, area_h),
+                                col_w,
+                                col_h,
+                                auto_crop,
+                                &output_path,
+                            ) {
+                                Ok(()) => sender.send(Ok(RenderInfo::Exported {
+                                    page_num,
+                                    output_path,
+                                }))?,
+                                Err(e) => sender.send(Err(e))?,
+                            }
+                            continue 'render_pages;
+                        }
+                        // Link extraction is handled before this macro.
                         RenderNotif::GetLinks(_) => {
                             continue 'render_pages;
                         }
                     }
                 }};
+            }
+
+            match receiver.try_recv() {
+                Err(TryRecvError::Empty) => (),
+                Err(TryRecvError::Disconnected) => return Ok(()),
+                Ok(RenderNotif::GetLinks(pn)) => {
+                    sender.send(Ok(RenderInfo::Links(extract_links(&doc, pn))))?;
+                    continue 'render_pages;
+                }
+                Ok(notif) => handle_notif!(notif),
             }
 
             struct PopOnNext<'a> {
@@ -729,6 +805,146 @@ pub fn start_rendering(
             }
         }
     }
+}
+
+pub struct ExportOptions<'a> {
+    pub page_num: usize,
+    pub output_dir: &'a Path,
+    pub area: (f32, f32),
+    pub col_w: u16,
+    pub col_h: u16,
+    pub invert: bool,
+    pub black: i32,
+    pub white: i32,
+    pub rotation: u16,
+    pub tinted: bool,
+    pub auto_crop: bool,
+    pub epub_font_size: Option<f32>,
+}
+
+pub fn export_document_page(
+    path: &Path,
+    options: ExportOptions<'_>,
+) -> Result<PathBuf, RenderError> {
+    #[cfg_attr(unix, allow(clippy::borrow_deref_ref))]
+    let mut doc = Document::open(&*path)?;
+
+    let doc_kind = match doc.is_reflowable() {
+        Ok(true) => DocumentKind::Reflowable,
+        Ok(false) | Err(_) => DocumentKind::Fixed,
+    };
+
+    if matches!(doc_kind, DocumentKind::Reflowable) {
+        let (layout_w, layout_h, default_em) =
+            epub_layout_for_area(options.area.0, options.area.1, options.col_w, options.col_h);
+        let layout_em = options.epub_font_size.unwrap_or(default_em);
+        doc.layout(layout_w, layout_h, clamp_epub_em(layout_em))?;
+    }
+
+    let n_pages =
+        NonZeroUsize::new(doc.page_count()? as usize).ok_or(RenderError::EmptyDocument)?;
+    let page_num = options.page_num.min(n_pages.get().saturating_sub(1));
+    let output_path =
+        export::next_export_path_in_dir(path, page_num, n_pages.get(), options.output_dir);
+
+    export_page(
+        &doc,
+        page_num,
+        None,
+        &PrevRender::default(),
+        options.invert,
+        options.black,
+        options.white,
+        options.tinted,
+        RotateDirection::from_degrees(options.rotation),
+        options.area,
+        options.col_w,
+        options.col_h,
+        options.auto_crop,
+        &output_path,
+    )?;
+
+    Ok(output_path)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn export_loaded_page(
+    doc: &Document,
+    rendered: &[PrevRender],
+    page_num: usize,
+    search_term: Option<&str>,
+    invert: bool,
+    black: i32,
+    white: i32,
+    tinted: bool,
+    rotate: RotateDirection,
+    area: (f32, f32),
+    col_w: u16,
+    col_h: u16,
+    auto_crop: bool,
+    output_path: &Path,
+) -> Result<(), RenderError> {
+    let fallback_prev_render = PrevRender::default();
+    let prev_render = rendered.get(page_num).unwrap_or(&fallback_prev_render);
+
+    export_page(
+        doc,
+        page_num,
+        search_term,
+        prev_render,
+        invert,
+        black,
+        white,
+        tinted,
+        rotate,
+        area,
+        col_w,
+        col_h,
+        auto_crop,
+        output_path,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn export_page(
+    doc: &Document,
+    page_num: usize,
+    search_term: Option<&str>,
+    prev_render: &PrevRender,
+    invert: bool,
+    black: i32,
+    white: i32,
+    tinted: bool,
+    rotate: RotateDirection,
+    area: (f32, f32),
+    col_w: u16,
+    col_h: u16,
+    auto_crop: bool,
+    output_path: &Path,
+) -> Result<(), RenderError> {
+    let page = doc.load_page(page_num as i32)?;
+    let (eff_black, eff_white) = if tinted {
+        (TINT_BLACK, TINT_WHITE)
+    } else {
+        (black, white)
+    };
+
+    let ctx = render_single_page(
+        &page,
+        search_term,
+        prev_render,
+        invert,
+        eff_black,
+        eff_white,
+        rotate,
+        area,
+        col_w,
+        col_h,
+    )?;
+    let img_data = copy_pixmap_rgb(&ctx.pixmap)?;
+    let rgb_img = image_pipeline::image_from_rgb_data(img_data)?;
+    let final_img = image_pipeline::process_rgb_image(rgb_img, &ctx.result_rects, auto_crop);
+    export::write_png(output_path, &final_img)
 }
 
 pub fn probe_document(path: &Path) -> Result<(), RenderError> {
@@ -1266,6 +1482,55 @@ mod tests {
             NonZeroUsize::new(64).unwrap(),
             None,
         ));
+    }
+
+    #[test]
+    fn export_document_page_writes_png_for_sample_pdf_when_available() {
+        let input = PathBuf::from("../data/2511.08880v1.pdf");
+        if !input.exists() {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "kitpdf-export-smoke-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let output = export_document_page(
+            &input,
+            ExportOptions {
+                page_num: 1,
+                output_dir: &dir,
+                area: (800.0, 1000.0),
+                col_w: 10,
+                col_h: 20,
+                invert: false,
+                black: MUPDF_BLACK,
+                white: MUPDF_WHITE,
+                rotation: 0,
+                tinted: false,
+                auto_crop: false,
+                epub_font_size: None,
+            },
+        )
+        .unwrap();
+        let bytes = fs::read(&output).unwrap();
+
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        assert!(
+            output
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("page-")
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     // --- RotateDirection ---

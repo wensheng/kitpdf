@@ -177,7 +177,9 @@ fn pending_bytes(images: &HashMap<usize, PageInfo>) -> u64 {
         .sum()
 }
 
-fn image_from_rgb_data(img_data: crate::renderer::ImageData) -> Result<RgbImage, RenderError> {
+pub(crate) fn image_from_rgb_data(
+    img_data: crate::renderer::ImageData,
+) -> Result<RgbImage, RenderError> {
     let crate::renderer::ImageData {
         pixels,
         width,
@@ -407,7 +409,11 @@ fn apply_search_highlights_and_crop(img: RgbImage, rects: &[HighlightRect]) -> R
     }
 }
 
-fn process_rgb_image(img: RgbImage, rects: &[HighlightRect], auto_crop: bool) -> RgbImage {
+pub(crate) fn process_rgb_image(
+    img: RgbImage,
+    rects: &[HighlightRect],
+    auto_crop: bool,
+) -> RgbImage {
     if rects.is_empty() {
         if auto_crop {
             return crop_whitespace(DynamicImage::ImageRgb8(img)).to_rgb8();

@@ -6,6 +6,7 @@
 
 mod app;
 mod error;
+mod export;
 mod image_pipeline;
 mod kitty;
 mod perf;
@@ -72,6 +73,28 @@ fn render_height_px(app: &App, ws: &WindowSize) -> f32 {
 }
 
 const LOADING_INDICATOR_DELAY: Duration = Duration::from_millis(90);
+const DEFAULT_EXPORT_WIDTH_PX: f32 = 1200.0;
+const DEFAULT_EXPORT_HEIGHT_PX: f32 = 1600.0;
+const DEFAULT_EXPORT_CELL_W: u16 = 10;
+const DEFAULT_EXPORT_CELL_H: u16 = 20;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CliOptions {
+    file_path: PathBuf,
+    invert_start: bool,
+    black: i32,
+    white: i32,
+    page: Option<usize>,
+    export: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CliAction {
+    Run(CliOptions),
+    Probe(PathBuf),
+    Help,
+    Version,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HorizontalAction {
@@ -116,13 +139,22 @@ fn main() -> anyhow::Result<()> {
 async fn inner_main() -> anyhow::Result<()> {
     let startup_started = Instant::now();
 
-    // --- CLI args (minimal; expand with clap later) -----------------------
     let args: Vec<String> = std::env::args().collect();
-
-    if let Some(path) = probe_mode_path(&args) {
-        renderer::probe_document(&path)?;
-        return Ok(());
-    }
+    let cli = match parse_cli_args(&args)? {
+        CliAction::Probe(path) => {
+            renderer::probe_document(&path)?;
+            return Ok(());
+        }
+        CliAction::Help => {
+            print_usage();
+            return Ok(());
+        }
+        CliAction::Version => {
+            println!("kitpdf {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        CliAction::Run(cli) => cli,
+    };
 
     // Optional logging (set RUST_LOG=debug)
     let _logger = if std::env::var("RUST_LOG").is_ok() {
@@ -135,48 +167,14 @@ async fn inner_main() -> anyhow::Result<()> {
         None
     };
 
-    // Parse --invert / file positional
-    let mut invert_start = false;
-    let mut file_path: Option<PathBuf> = None;
-    let mut black = MUPDF_BLACK;
-    let mut white = MUPDF_WHITE;
-
-    let mut iter = args.into_iter().skip(1);
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "-i" | "--invert" => invert_start = true,
-            "-h" | "--help" => {
-                print_usage();
-                return Ok(());
-            }
-            "--version" => {
-                println!("kitpdf {}", env!("CARGO_PKG_VERSION"));
-                return Ok(());
-            }
-            "-b" | "--black-color" => {
-                if let Some(color) = iter.next() {
-                    black = parse_color(&color)?;
-                }
-            }
-            "-w" | "--white-color" => {
-                if let Some(color) = iter.next() {
-                    white = parse_color(&color)?;
-                }
-            }
-            s if !s.starts_with('-') => {
-                file_path = Some(PathBuf::from(s));
-            }
-            other => {
-                anyhow::bail!("unknown argument: {other}\nUsage: kitpdf [options] <file>");
-            }
-        }
-    }
-
-    let path = file_path
-        .ok_or_else(|| anyhow::anyhow!("Usage: kitpdf [options] <file>"))?
-        .canonicalize()?;
+    let path = cli.file_path.canonicalize()?;
 
     preflight_document(&path)?;
+
+    if cli.export {
+        export_and_exit(&path, &cli)?;
+        return Ok(());
+    }
 
     // --- Terminal setup ---------------------------------------------------
     let ws = get_window_size()?;
@@ -239,8 +237,8 @@ async fn inner_main() -> anyhow::Result<()> {
             renderer_cmd_rx,
             cell_h,
             cell_w,
-            black,
-            white,
+            cli.black,
+            cli.white,
         ) {
             log::error!("render thread send error: {e}");
         }
@@ -252,11 +250,6 @@ async fn inner_main() -> anyhow::Result<()> {
         height_px: render_height_px(&app, &ws),
     })?;
 
-    // If invert was requested from CLI, send the toggle now.
-    if invert_start {
-        to_renderer.send(RenderNotif::Invert)?;
-    }
-
     // --- Converter task ---------------------------------------------------
     tokio::spawn(run_conversion_loop(
         converter_tx,
@@ -267,17 +260,13 @@ async fn inner_main() -> anyhow::Result<()> {
 
     // Load persisted state for this file.
     if let Some(saved) = state::load_state(&path) {
-        app.page = saved.page;
+        app.page = cli.page.unwrap_or(saved.page);
         app.rotation = saved.rotation;
-        app.inverted = saved.inverted;
+        app.inverted = cli.invert_start || saved.inverted;
         app.auto_crop = saved.auto_crop;
         app.tinted = saved.tinted;
         app.epub_font_size = saved.epub_font_size;
 
-        if app.page > 0 {
-            to_renderer.send(RenderNotif::JumpToPage(app.page))?;
-            to_converter.send(ConverterMsg::GoToPage(app.page))?;
-        }
         if let Some(font_size) = saved.epub_font_size {
             to_renderer.send(RenderNotif::SetFontSize(font_size))?;
         }
@@ -285,7 +274,7 @@ async fn inner_main() -> anyhow::Result<()> {
         for _ in 0..(saved.rotation / 90) {
             to_renderer.send(RenderNotif::Rotate)?;
         }
-        if saved.inverted {
+        if app.inverted {
             to_renderer.send(RenderNotif::Invert)?;
         }
         if saved.tinted {
@@ -294,6 +283,17 @@ async fn inner_main() -> anyhow::Result<()> {
         if saved.auto_crop {
             to_converter.send(ConverterMsg::AutoCrop(true))?;
         }
+    } else {
+        app.page = cli.page.unwrap_or(0);
+        app.inverted = cli.invert_start;
+        if app.inverted {
+            to_renderer.send(RenderNotif::Invert)?;
+        }
+    }
+
+    if app.page > 0 {
+        to_renderer.send(RenderNotif::JumpToPage(app.page))?;
+        to_converter.send(ConverterMsg::GoToPage(app.page))?;
     }
 
     let render_rx = render_rx.into_stream();
@@ -382,7 +382,7 @@ async fn enter_event_loop(
             // --- Keyboard / mouse input ---
             Some(ev_result) = next_ev => {
                 let ev = ev_result?;
-                match handle_event(&ev, app, ws, &to_renderer, &to_converter).await? {
+                match handle_event(&ev, app, ws, path, &to_renderer, &to_converter).await? {
                     EventOutcome::Quit => return Ok(()),
                     EventOutcome::Redraw => needs_redraw = true,
                     EventOutcome::RedrawStatus => needs_status_redraw = true,
@@ -432,6 +432,14 @@ async fn enter_event_loop(
                     Ok(RenderInfo::Links(links)) => {
                         app.input_mode = InputMode::Links { links, input: String::new() };
                         needs_redraw = true;
+                    }
+                    Ok(RenderInfo::Exported { page_num, output_path }) => {
+                        app.show_info(format!(
+                            "exported page {} to {}",
+                            page_num + 1,
+                            output_path.display()
+                        ));
+                        needs_status_redraw = true;
                     }
                     Err(e) => {
                         if app.n_pages == 0 {
@@ -641,6 +649,7 @@ async fn handle_event(
     ev: &Event,
     app: &mut App,
     ws: &WindowSize,
+    path: &Path,
     to_renderer: &Sender<RenderNotif>,
     to_converter: &Sender<ConverterMsg>,
 ) -> anyhow::Result<EventOutcome> {
@@ -1105,6 +1114,18 @@ async fn handle_event(
             app.show_info("extracting links...".to_owned());
         }
 
+        // Export current page
+        KeyCode::Char('e') => {
+            let output_path = export::next_export_path(path, app.page, app.n_pages)?;
+            to_renderer.send(RenderNotif::ExportPage {
+                page_num: app.page,
+                output_path,
+                auto_crop: app.auto_crop,
+            })?;
+            app.show_info(format!("exporting page {}...", app.page + 1));
+            return Ok(EventOutcome::RedrawStatus);
+        }
+
         // Manual refresh
         KeyCode::Char('R') | KeyCode::F(5) => {
             to_renderer.send(RenderNotif::Refresh)?;
@@ -1114,7 +1135,7 @@ async fn handle_event(
         // Help
         KeyCode::Char('?') => {
             app.show_info(
-                "Space next  PgUp/PgDn page  ←/→ page  ↑/↓ scroll  j/k page  g goto  t toc  / search  n/N result  z zoom  o/O +/-  i invert  r rotate  c crop  d tint  M meta  f links  q quit".to_owned(),
+                "Space next  PgUp/PgDn page  ←/→ page  ↑/↓ scroll  j/k page  g goto  t toc  / search  n/N result  z zoom  o/O +/-  i invert  r rotate  c crop  d tint  M meta  f links  e export  q quit".to_owned(),
             );
         }
 
@@ -1124,10 +1145,141 @@ async fn handle_event(
     Ok(EventOutcome::Redraw)
 }
 
-fn probe_mode_path(args: &[String]) -> Option<PathBuf> {
-    match args {
-        [_, flag, path] if flag == "--probe-document" => Some(PathBuf::from(path)),
-        _ => None,
+fn parse_cli_args(args: &[String]) -> anyhow::Result<CliAction> {
+    if let [_, flag, path] = args
+        && flag == "--probe-document"
+    {
+        return Ok(CliAction::Probe(PathBuf::from(path)));
+    }
+
+    let mut invert_start = false;
+    let mut file_path: Option<PathBuf> = None;
+    let mut black = MUPDF_BLACK;
+    let mut white = MUPDF_WHITE;
+    let mut page = None;
+    let mut export = false;
+
+    let mut iter = args.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-i" | "--invert" => invert_start = true,
+            "-e" | "--export" => export = true,
+            "-h" | "--help" => return Ok(CliAction::Help),
+            "--version" => return Ok(CliAction::Version),
+            "-p" | "--page" => {
+                let value = iter.next().ok_or_else(|| {
+                    anyhow::anyhow!("missing value for {arg}\nUsage: kitpdf [options] <file>")
+                })?;
+                page = Some(parse_page_arg(value)?);
+            }
+            "-b" | "--black-color" => {
+                let value = iter.next().ok_or_else(|| {
+                    anyhow::anyhow!("missing value for {arg}\nUsage: kitpdf [options] <file>")
+                })?;
+                black = parse_color(value)?;
+            }
+            "-w" | "--white-color" => {
+                let value = iter.next().ok_or_else(|| {
+                    anyhow::anyhow!("missing value for {arg}\nUsage: kitpdf [options] <file>")
+                })?;
+                white = parse_color(value)?;
+            }
+            s if !s.starts_with('-') => {
+                if file_path.is_some() {
+                    anyhow::bail!("multiple input files provided\nUsage: kitpdf [options] <file>");
+                }
+                file_path = Some(PathBuf::from(s));
+            }
+            other => {
+                anyhow::bail!("unknown argument: {other}\nUsage: kitpdf [options] <file>");
+            }
+        }
+    }
+
+    let file_path = file_path.ok_or_else(|| anyhow::anyhow!("Usage: kitpdf [options] <file>"))?;
+
+    Ok(CliAction::Run(CliOptions {
+        file_path,
+        invert_start,
+        black,
+        white,
+        page,
+        export,
+    }))
+}
+
+fn parse_page_arg(value: &str) -> anyhow::Result<usize> {
+    let page = value
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("invalid page number: {value}"))?;
+    if page == 0 {
+        anyhow::bail!("page number must be 1 or greater");
+    }
+    Ok(page - 1)
+}
+
+fn export_and_exit(path: &Path, cli: &CliOptions) -> anyhow::Result<()> {
+    let saved = state::load_state(path);
+    let saved = saved.as_ref();
+    let page_num = cli.page.unwrap_or(0);
+    let (area, col_w, col_h) = export_render_geometry();
+    let output_dir = std::env::current_dir()?;
+    let output_path = renderer::export_document_page(
+        path,
+        renderer::ExportOptions {
+            page_num,
+            output_dir: &output_dir,
+            area,
+            col_w,
+            col_h,
+            invert: cli.invert_start || saved.is_some_and(|s| s.inverted),
+            black: cli.black,
+            white: cli.white,
+            rotation: saved.map_or(0, |s| s.rotation),
+            tinted: saved.is_some_and(|s| s.tinted),
+            auto_crop: saved.is_some_and(|s| s.auto_crop),
+            epub_font_size: saved.and_then(|s| s.epub_font_size),
+        },
+    )?;
+
+    println!("{}", output_path.display());
+    Ok(())
+}
+
+fn export_render_geometry() -> ((f32, f32), u16, u16) {
+    let Ok(window) = crossterm::terminal::window_size() else {
+        return (
+            (DEFAULT_EXPORT_WIDTH_PX, DEFAULT_EXPORT_HEIGHT_PX),
+            DEFAULT_EXPORT_CELL_W,
+            DEFAULT_EXPORT_CELL_H,
+        );
+    };
+    let Ok((cols, rows)) = crossterm::terminal::size() else {
+        return (
+            (DEFAULT_EXPORT_WIDTH_PX, DEFAULT_EXPORT_HEIGHT_PX),
+            DEFAULT_EXPORT_CELL_W,
+            DEFAULT_EXPORT_CELL_H,
+        );
+    };
+    if window.width == 0 || window.height == 0 || cols == 0 || rows <= 1 {
+        return (
+            (DEFAULT_EXPORT_WIDTH_PX, DEFAULT_EXPORT_HEIGHT_PX),
+            DEFAULT_EXPORT_CELL_W,
+            DEFAULT_EXPORT_CELL_H,
+        );
+    }
+
+    let cell_w = (window.width / cols).max(1);
+    let cell_h = (window.height / rows).max(1);
+    let page_h = rows.saturating_sub(1) * cell_h;
+    if page_h == 0 {
+        (
+            (DEFAULT_EXPORT_WIDTH_PX, DEFAULT_EXPORT_HEIGHT_PX),
+            DEFAULT_EXPORT_CELL_W,
+            DEFAULT_EXPORT_CELL_H,
+        )
+    } else {
+        ((f32::from(window.width), f32::from(page_h)), cell_w, cell_h)
     }
 }
 
@@ -1516,6 +1668,8 @@ ARGUMENTS:
     <file>                    PDF or EPUB file to open
 
 OPTIONS:
+    -p, --page <N>            Start on page N (1-indexed; ignores saved page)
+    -e, --export              Export one page to PNG and exit
     -i, --invert              Start with inverted colours
     -b, --black-color <css>   Custom black colour (e.g. '#1a1a2e')
     -w, --white-color <css>   Custom white colour (e.g. '#e0e0e0')
@@ -1542,6 +1696,7 @@ KEYBOARD:
     d                        Toggle warm tint (sepia)
     M                        Document metadata
     f                        Show links (type number + Enter to follow)
+    e                        Export current page to PNG
     R, F5                    Refresh
     ?                        Help summary in status bar
     q, Esc                   Quit
@@ -1564,7 +1719,64 @@ fn parse_color(cs: &str) -> anyhow::Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+
+    fn cli_args(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+
+    fn parsed_run(args: &[&str]) -> CliOptions {
+        match parse_cli_args(&cli_args(args)).unwrap() {
+            CliAction::Run(cli) => cli,
+            other => panic!("expected run action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_cli_page_short_flag_is_one_indexed() {
+        let cli = parsed_run(&["kitpdf", "-p", "12", "doc.pdf"]);
+
+        assert_eq!(cli.page, Some(11));
+        assert_eq!(cli.file_path, PathBuf::from("doc.pdf"));
+    }
+
+    #[test]
+    fn parse_cli_export_and_long_page_flag() {
+        let cli = parsed_run(&["kitpdf", "--export", "--page", "3", "doc.pdf"]);
+
+        assert!(cli.export);
+        assert_eq!(cli.page, Some(2));
+    }
+
+    #[test]
+    fn parse_cli_existing_display_flags() {
+        let cli = parsed_run(&["kitpdf", "-i", "-b", "#000000", "-w", "#ffffff", "doc.pdf"]);
+
+        assert!(cli.invert_start);
+        assert_eq!(cli.black, MUPDF_BLACK);
+        assert_eq!(cli.white, MUPDF_WHITE);
+    }
+
+    #[test]
+    fn parse_cli_rejects_zero_page() {
+        let err = parse_cli_args(&cli_args(&["kitpdf", "--page", "0", "doc.pdf"])).unwrap_err();
+
+        assert!(err.to_string().contains("1 or greater"));
+    }
+
+    #[test]
+    fn parse_cli_rejects_non_numeric_page() {
+        let err = parse_cli_args(&cli_args(&["kitpdf", "--page", "abc", "doc.pdf"])).unwrap_err();
+
+        assert!(err.to_string().contains("invalid page number"));
+    }
+
+    #[test]
+    fn parse_cli_rejects_missing_page_value() {
+        let err = parse_cli_args(&cli_args(&["kitpdf", "--page"])).unwrap_err();
+
+        assert!(err.to_string().contains("missing value"));
+    }
 
     #[test]
     fn startup_render_error_message_for_pdf() {

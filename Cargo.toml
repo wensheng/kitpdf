@@ -1,6 +1,6 @@
 [package]
 name = "kitpdf"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 rust-version = "1.86"
 description = "A terminal-based PDF viewer using the Kitty graphics protocol"
@@ -26,7 +26,7 @@ kittage = { version = "0.4.0", features = ["crossterm-tokio", "image-crate", "lo
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 
 # Image processing (raw RGB buffers plus rayon pixel ops in the image pipeline)
-image = { version = "0.25", features = ["rayon"], default-features = false }
+image = { version = "0.25", features = ["png", "rayon"], default-features = false }
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "io-util"] }

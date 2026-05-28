@@ -27,6 +27,8 @@ Key differences:
 ## Options
 
 ```
+-p, --page <N>            Start on page N (1-indexed; ignores saved page position)
+-e, --export              Export one page to PNG and exit
 -i, --invert              Start with inverted colours
 -b, --black-color <css>   Custom black colour (CSS colour string, e.g. '#1a1a2e')
 -w, --white-color <css>   Custom white colour (CSS colour string, e.g. '#e0e0e0')
@@ -159,6 +161,7 @@ useful for academic papers with wide margins.
 |-----|--------|
 | `M` | Show document metadata (title, author, dates, etc.) |
 | `f` | Show links on the current page |
+| `e` | Export current page to PNG |
 | `?` | Show a one-line help summary in the status bar |
 
 ### Table of Contents (`t`)
@@ -190,6 +193,17 @@ number and press `Enter` to follow:
   `xdg-open` on Linux).
 
 Press `Esc` to cancel. Use `Backspace` to correct the number.
+
+### PNG Export
+
+`-e, --export` writes one page to a PNG file and exits without opening the
+viewer. Use `-p, --page <N>` to select the exported page; without `--page`,
+page 1 is exported.
+
+While reading, press `e` to export the current page. Exported files are written
+to the current directory, include the 1-indexed page number, shorten long source
+filenames, replace spaces with dashes, and add a numeric suffix instead of
+overwriting an existing PNG.
 
 ## Custom Colours
 
