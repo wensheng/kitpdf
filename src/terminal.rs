@@ -71,8 +71,7 @@ impl Drop for TerminalGuard {
 pub fn reset_terminal() {
     // Delete all Kitty graphics images so they don't linger after exit.
     // Raw escape: APC + "Ga=d" + ST  (action=delete, which=all)
-    let _ = stdout().write_all(b"\x1b_Ga=d\x1b\\");
-    let _ = stdout().flush();
+    let _ = crate::kitty::write_kitty_packet(b"\x1b_Ga=d\x1b\\");
 
     let _ = disable_raw_mode();
     let _ = execute!(

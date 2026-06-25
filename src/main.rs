@@ -40,6 +40,7 @@ use image_pipeline::{ConverterMsg, run_conversion_loop};
 use kitty::{
     KittyDisplay, KittyReadyToDisplay, Pos, clear_kitty_image, delete_kitty_images,
     display_kitty_images, do_shms_work, run_action, supports_kitty_graphics,
+    tmux_passthrough_needed,
 };
 use renderer::{DocumentKind, MUPDF_BLACK, MUPDF_WHITE, RenderInfo, RenderNotif};
 use terminal::{
@@ -1568,7 +1569,9 @@ async fn draw(
         return Ok(());
     }
 
-    if !matches!(last_drawn_surface, Some(DrawSurface::Page(_))) {
+    let last_was_same_page_surface = matches!(last_drawn_surface, Some(DrawSurface::Page(surface)) if *surface == target_surface);
+    let last_was_page = matches!(last_drawn_surface, Some(DrawSurface::Page(_)));
+    if !last_was_page || (tmux_passthrough_needed() && !last_was_same_page_surface) {
         clear_page_area(ws)?;
     }
 

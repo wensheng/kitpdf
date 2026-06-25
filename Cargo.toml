@@ -1,6 +1,6 @@
 [package]
 name = "kitpdf"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 rust-version = "1.86"
 description = "A terminal-based PDF viewer using the Kitty graphics protocol"
