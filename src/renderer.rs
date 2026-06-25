@@ -1,11 +1,16 @@
 // Blocking PDF render thread.
 
 use std::{
+    any::Any,
     collections::VecDeque,
     num::NonZeroUsize,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
     thread::sleep,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use flume::{Receiver, SendError, Sender, TryRecvError};
@@ -32,6 +37,97 @@ const EPUB_EM_MAX: f32 = 12.0;
 const EPUB_APPROX_CHAR_WIDTH_EM: f32 = 0.55;
 const EPUB_TARGET_CHARS_PER_LINE: f32 = 54.0;
 const RENDER_WINDOW: usize = 24;
+
+/// How long a single page render may run before the watchdog reports it as slow.
+const SLOW_RENDER_WARN: Duration = Duration::from_secs(5);
+
+// ---------------------------------------------------------------------------
+// Render watchdog
+// ---------------------------------------------------------------------------
+
+/// Shared heartbeat the watchdog thread reads to detect a render that is taking unusually
+/// long (e.g. a pathological page that makes MuPDF spin). MuPDF cannot be interrupted
+/// mid-call from another thread, so the watchdog only *reports* a slow page — it does not
+/// abort it. True hang recovery would require rendering suspect pages in a separate
+/// process (the `--probe-document` subprocess is the precedent); that is a deliberate
+/// follow-up, not implemented here.
+struct RenderHeartbeat {
+    base: Instant,
+    /// Milliseconds since `base` when the current render began.
+    started_at_ms: AtomicU64,
+    page: AtomicUsize,
+    active: AtomicBool,
+    /// Set once the watchdog has reported the in-flight render, to avoid repeat warnings.
+    warned: AtomicBool,
+}
+
+impl RenderHeartbeat {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            base: Instant::now(),
+            started_at_ms: AtomicU64::new(0),
+            page: AtomicUsize::new(0),
+            active: AtomicBool::new(false),
+            warned: AtomicBool::new(false),
+        })
+    }
+
+    fn begin(&self, page: usize) {
+        self.page.store(page, Ordering::Relaxed);
+        self.warned.store(false, Ordering::Relaxed);
+        self.started_at_ms
+            .store(self.base.elapsed().as_millis() as u64, Ordering::Relaxed);
+        self.active.store(true, Ordering::Release);
+    }
+
+    fn end(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+/// Spawn a detached thread that periodically checks the heartbeat and emits a one-shot
+/// notice when a render exceeds [`SLOW_RENDER_WARN`]. Exits when the result channel closes.
+fn spawn_render_watchdog(
+    heartbeat: Arc<RenderHeartbeat>,
+    sender: Sender<Result<RenderInfo, RenderError>>,
+) {
+    std::thread::spawn(move || {
+        loop {
+            sleep(Duration::from_millis(1000));
+            if !heartbeat.active.load(Ordering::Acquire) {
+                continue;
+            }
+            let started = heartbeat.started_at_ms.load(Ordering::Relaxed);
+            let now = heartbeat.base.elapsed().as_millis() as u64;
+            if now.saturating_sub(started) >= SLOW_RENDER_WARN.as_millis() as u64
+                && !heartbeat.warned.swap(true, Ordering::Relaxed)
+            {
+                let page = heartbeat.page.load(Ordering::Relaxed);
+                log::warn!("page {page} render exceeded {SLOW_RENDER_WARN:?}");
+                if sender
+                    .send(Ok(RenderInfo::Notice(format!(
+                        "Rendering page {} is taking a while…",
+                        page + 1
+                    ))))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Extract a human-readable message from a caught panic payload.
+fn panic_message(panic: &(dyn Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_owned()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Message types
@@ -91,6 +187,8 @@ pub enum RenderInfo {
         page_num: usize,
         output_path: PathBuf,
     },
+    /// Non-fatal status message (e.g. the watchdog reporting an unusually slow page).
+    Notice(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +399,9 @@ pub fn start_rendering(
 
     let mut need_rerender = VecDeque::new();
 
+    let heartbeat = RenderHeartbeat::new();
+    spawn_render_watchdog(Arc::clone(&heartbeat), sender.clone());
+
     #[cfg(windows)]
     let path = path.to_string_lossy();
 
@@ -465,8 +566,13 @@ pub fn start_rendering(
                 ($notif:ident) => {{
                     match $notif {
                         RenderNotif::Refresh => {
+                            // Reload: force re-render AND drop cached search results so
+                            // highlights are recomputed against the (possibly changed)
+                            // document instead of replaying stale quads.
                             for page in &mut rendered {
                                 page.successful = false;
+                                page.num_search_found = None;
+                                page.search_quads = None;
                             }
                             continue 'render_pages;
                         }
@@ -652,62 +758,80 @@ pub fn start_rendering(
                     continue;
                 }
 
-                let page = match doc.load_page(page_num as i32) {
-                    Err(e) => {
-                        sender.send(Err(RenderError::Mupdf(e)))?;
-                        continue;
-                    }
-                    Ok(p) => p,
-                };
-
                 let (eff_black, eff_white) = if tinted {
                     (TINT_BLACK, TINT_WHITE)
                 } else {
                     (black, white)
                 };
 
-                let render_started = std::time::Instant::now();
-                match render_single_page(
-                    &page,
-                    search_term.as_deref(),
-                    r,
-                    invert,
-                    eff_black,
-                    eff_white,
-                    rotate,
-                    (area_w, area_h),
-                    col_w,
-                    col_h,
-                ) {
-                    Ok(ctx) => {
+                // Render this page under `catch_unwind` so a panic in MuPDF or the image
+                // pipeline on one malformed page cannot kill the render thread and freeze
+                // the rest of the session. The panic hook is suppressed for the duration so
+                // a caught panic does not disturb the live terminal.
+                let render_started = Instant::now();
+                heartbeat.begin(page_num);
+                let outcome = {
+                    let _suppress = crate::PanicHookSuppressor::new();
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                        || -> Result<(ImageData, Vec<HighlightRect>), RenderError> {
+                            let page = doc.load_page(page_num as i32)?;
+                            let ctx = render_single_page(
+                                &page,
+                                search_term.as_deref(),
+                                r,
+                                invert,
+                                eff_black,
+                                eff_white,
+                                rotate,
+                                (area_w, area_h),
+                                col_w,
+                                col_h,
+                            )?;
+                            let copy_started = Instant::now();
+                            let img_data = copy_pixmap_rgb(&ctx.pixmap)?;
+                            perf::log_page_timing(
+                                "render_rgb_copy",
+                                page_num,
+                                copy_started.elapsed(),
+                            );
+                            Ok((img_data, ctx.result_rects))
+                        },
+                    ))
+                };
+                heartbeat.end();
+
+                match outcome {
+                    Ok(Ok((img_data, result_rects))) => {
                         perf::log_page_timing("render_page", page_num, render_started.elapsed());
-
-                        let copy_started = std::time::Instant::now();
-                        let img_data = match copy_pixmap_rgb(&ctx.pixmap) {
-                            Ok(img_data) => img_data,
-                            Err(e) => {
-                                sender.send(Err(e))?;
-                                continue;
-                            }
-                        };
-                        perf::log_page_timing("render_rgb_copy", page_num, copy_started.elapsed());
-
                         log::debug!(
                             "rendered page {page_num} at {}x{}",
                             img_data.width,
                             img_data.height
                         );
 
-                        r.num_search_found = Some(ctx.result_rects.len());
+                        r.num_search_found = Some(result_rects.len());
                         r.successful = true;
 
                         sender.send(Ok(RenderInfo::Page(PageInfo {
                             img_data,
                             page_num,
-                            result_rects: ctx.result_rects,
+                            result_rects,
                         })))?;
                     }
-                    Err(e) => sender.send(Err(e))?,
+                    Ok(Err(e)) => sender.send(Err(e))?,
+                    Err(panic) => {
+                        let message = panic_message(&*panic);
+                        log::error!("panic while rendering page {page_num}: {message}");
+                        // Treat the page as handled so the loop does not spin retrying it,
+                        // and surface the failure in the status bar. A manual Refresh
+                        // (Ctrl-R) clears this and retries.
+                        r.successful = true;
+                        r.num_search_found = Some(0);
+                        sender.send(Err(RenderError::Panicked {
+                            page: page_num,
+                            message,
+                        }))?;
+                    }
                 }
 
                 match receiver.try_recv() {
@@ -720,42 +844,57 @@ pub fn start_rendering(
                 }
             }
 
-            // Search remaining pages for match counts.
+            // Search remaining pages for match counts. This background count shares the
+            // render thread, so it yields to foreground work (navigation, re-render) after
+            // *every* searched page — not just once per batch — to keep page turns
+            // responsive while a long search counts a large document.
             if let Some(ref term) = search_term {
                 let mut search_start = start_point;
                 loop {
                     const SEARCH_AT_TIME: usize = 20;
 
-                    let page_idx = rendered[search_start..]
-                        .iter_mut()
-                        .enumerate()
-                        .take(SEARCH_AT_TIME)
-                        .filter(|(_, r)| r.num_search_found.is_none())
-                        .map(|(idx, r)| (idx + search_start, r));
+                    let batch_end = (search_start + SEARCH_AT_TIME).min(n_pages.get());
+                    for page_num in search_start..batch_end {
+                        if rendered[page_num].num_search_found.is_some() {
+                            continue;
+                        }
 
-                    for (page_num, r) in page_idx {
                         let search_res = doc
                             .load_page(page_num as i32)
                             .and_then(|page| search_page(&page, Some(term), 0));
 
-                        let num_results = if let Ok(quads) = search_res {
-                            let count = quads.len();
-                            r.search_quads = Some(quads);
-                            count
-                        } else {
-                            r.search_quads = None;
-                            0
-                        };
+                        {
+                            let r = &mut rendered[page_num];
+                            let num_results = if let Ok(quads) = search_res {
+                                let count = quads.len();
+                                r.search_quads = Some(quads);
+                                count
+                            } else {
+                                r.search_quads = None;
+                                0
+                            };
 
-                        if num_results > 0 {
-                            r.successful = false;
+                            if num_results > 0 {
+                                r.successful = false;
+                            }
+                            r.num_search_found = Some(num_results);
+
+                            sender.send(Ok(RenderInfo::SearchResults {
+                                page_num,
+                                num_results,
+                            }))?;
                         }
-                        r.num_search_found = Some(num_results);
 
-                        sender.send(Ok(RenderInfo::SearchResults {
-                            page_num,
-                            num_results,
-                        }))?;
+                        // Yield after each searched page so a page turn or re-render
+                        // request preempts the background count almost immediately.
+                        match receiver.try_recv() {
+                            Err(TryRecvError::Empty) => (),
+                            Err(TryRecvError::Disconnected) => return Ok(()),
+                            Ok(RenderNotif::GetLinks(pn)) => {
+                                sender.send(Ok(RenderInfo::Links(extract_links(&doc, pn))))?;
+                            }
+                            Ok(msg) => handle_notif!(msg),
+                        }
                     }
 
                     search_start += SEARCH_AT_TIME;
@@ -1305,6 +1444,38 @@ mod tests {
     #[test]
     fn fake_epub_reports_error_and_exits() {
         assert_invalid_document_exits("epub", b"not a real epub");
+    }
+
+    // --- panic isolation / watchdog helpers ---
+
+    #[test]
+    fn panic_message_extracts_str_and_string_payloads() {
+        let from_str = std::panic::catch_unwind(|| panic!("boom")).unwrap_err();
+        assert_eq!(panic_message(&*from_str), "boom");
+
+        let from_string =
+            std::panic::catch_unwind(|| panic!("{}", String::from("dynamic"))).unwrap_err();
+        assert_eq!(panic_message(&*from_string), "dynamic");
+
+        let other: Box<dyn std::any::Any + Send> = Box::new(42_u32);
+        assert_eq!(panic_message(&*other), "unknown panic");
+    }
+
+    #[test]
+    fn heartbeat_begin_records_page_and_end_clears() {
+        let hb = RenderHeartbeat::new();
+        assert_eq!(hb.started_at_ms.load(Ordering::Relaxed), 0);
+        assert!(!hb.active.load(Ordering::Acquire));
+
+        hb.begin(7);
+        assert_eq!(hb.page.load(Ordering::Relaxed), 7);
+        assert!(!hb.warned.load(Ordering::Relaxed));
+        assert!(hb.active.load(Ordering::Acquire));
+        // `begin` may record 0ms if called immediately; the explicit active flag is the
+        // signal of an in-flight render instead of relying on a nonzero timestamp.
+
+        hb.end();
+        assert!(!hb.active.load(Ordering::Acquire));
     }
 
     #[test]

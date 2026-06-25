@@ -1,6 +1,6 @@
 [package]
 name = "kitpdf"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2024"
 rust-version = "1.86"
 description = "A terminal-based PDF viewer using the Kitty graphics protocol"
@@ -17,10 +17,7 @@ path = "src/main.rs"
 [dependencies]
 # MuPDF document/rendering support.
 # EPUB depends on MuPDF's HTML engine, so both `html` and `epub` must be enabled.
-mupdf = { version = "0.6.0", default-features = false, features = ["svg", "system-fonts", "img", "html", "epub"] }
-
-# Kitty graphics protocol
-kittage = { version = "0.4.0", features = ["crossterm-tokio", "image-crate", "log"] }
+mupdf = { version = "0.8.0", default-features = false, features = ["svg", "system-fonts", "img", "html", "epub"] }
 
 # Terminal I/O
 crossterm = { version = "0.29.0", features = ["event-stream"] }
@@ -29,7 +26,7 @@ crossterm = { version = "0.29.0", features = ["event-stream"] }
 image = { version = "0.25", features = ["png", "rayon"], default-features = false }
 
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "io-util", "time"] }
 
 # Async utilities (StreamExt for flume receiver stream)
 futures-util = { version = "0.3", default-features = false }
@@ -70,6 +67,10 @@ md-5 = "0.11"
 # Performance allocator (mimalloc is faster for many small allocs)
 mimalloc = "0.1"
 lazy_static = "1.5.0"
+
+[target.'cfg(unix)'.dependencies]
+psx-shm = "0.2"
+rustix = { version = "1", default-features = false, features = ["shm"] }
 
 [profile.production]
 inherits = "release"

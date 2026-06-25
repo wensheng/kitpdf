@@ -8,4 +8,6 @@ pub enum RenderError {
     EmptyDocument,
     #[error("conversion error: {0}")]
     Converting(String),
+    #[error("rendering page {} failed: {message}", page + 1)]
+    Panicked { page: usize, message: String },
 }

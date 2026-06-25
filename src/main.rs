@@ -29,17 +29,16 @@ use crossterm::{
 };
 use flume::Sender;
 use futures_util::{FutureExt as _, stream::StreamExt as _};
-use kittage::{
-    action::Action,
-    delete::{ClearOrDelete, DeleteConfig, WhichToDelete},
-};
 
 use app::{App, InputMode, ScrollAction, SearchJumpResolution, StatusMsg};
 use error::RenderError;
 use image_pipeline::{ConverterMsg, run_conversion_loop};
 use kitty::{
-    KittyDisplay, KittyReadyToDisplay, Pos, clear_kitty_image, delete_kitty_images,
-    display_kitty_images, do_shms_work, run_action, supports_kitty_graphics,
+    KittyDisplay, KittyReadyToDisplay, Pos,
+    action::Action,
+    clear_kitty_image,
+    delete::{ClearOrDelete, DeleteConfig, WhichToDelete},
+    delete_kitty_images, display_kitty_images, do_shms_work, run_action, supports_kitty_graphics,
     tmux_passthrough_needed,
 };
 use renderer::{DocumentKind, MUPDF_BLACK, MUPDF_WHITE, RenderInfo, RenderNotif};
@@ -54,6 +53,34 @@ use terminal::{
 
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// ---------------------------------------------------------------------------
+// Panic isolation
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Set on the render thread while a per-page render runs inside `catch_unwind`. The
+    /// global panic hook checks this (the hook runs on the panicking thread) and skips the
+    /// terminal-reset/stderr path so a caught, recovered page panic leaves the UI intact.
+    static SUPPRESS_PANIC_HOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII guard that marks the current thread as "panics here are caught and recovered" for
+/// the duration of a `catch_unwind` region. Resets the flag on drop (including unwind).
+pub(crate) struct PanicHookSuppressor;
+
+impl PanicHookSuppressor {
+    pub(crate) fn new() -> Self {
+        SUPPRESS_PANIC_HOOK.with(|c| c.set(true));
+        Self
+    }
+}
+
+impl Drop for PanicHookSuppressor {
+    fn drop(&mut self) {
+        SUPPRESS_PANIC_HOOK.with(|c| c.set(false));
+    }
+}
 
 fn render_width_px(app: &App, ws: &WindowSize) -> f32 {
     let zf = if app.supports_zoom() {
@@ -74,6 +101,10 @@ fn render_height_px(app: &App, ws: &WindowSize) -> f32 {
 }
 
 const LOADING_INDICATOR_DELAY: Duration = Duration::from_millis(90);
+/// Coalesce a burst of terminal-resize events (e.g. while dragging the window edge) into a
+/// single renderer Area notification, so reflowable docs relayout/re-render once on settle
+/// instead of once per intermediate size.
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(120);
 const DEFAULT_EXPORT_WIDTH_PX: f32 = 1200.0;
 const DEFAULT_EXPORT_HEIGHT_PX: f32 = 1600.0;
 const DEFAULT_EXPORT_CELL_W: u16 = 10;
@@ -183,8 +214,15 @@ async fn inner_main() -> anyhow::Result<()> {
     let _guard = TerminalGuard::enter()?;
 
     // Install a panic hook that restores the terminal before printing the panic.
+    // Render-thread panics that are caught and isolated (see `PanicHookSuppressor`) must
+    // NOT reset the terminal or print to it, otherwise one bad page would corrupt the
+    // live display; for those we only log and let `catch_unwind` recover.
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        if SUPPRESS_PANIC_HOOK.with(|c| c.get()) {
+            log::error!("caught isolated panic: {info}");
+            return;
+        }
         reset_terminal();
         original_hook(info);
     }));
@@ -356,8 +394,9 @@ async fn enter_event_loop(
     let mut loading_deadline: Option<tokio::time::Instant> = None;
     let mut loading_page: Option<usize> = None;
     let mut show_loading_for_page: Option<usize> = None;
+    let mut resize_deadline: Option<tokio::time::Instant> = None;
     let mut last_drawn_surface: Option<DrawSurface> = None;
-    let mut displayed_image_id: Option<kittage::ImageId> = None;
+    let mut displayed_image_id: Option<kitty::ImageId> = None;
 
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
@@ -373,6 +412,17 @@ async fn enter_event_loop(
         }
         .fuse();
         tokio::pin!(loading_timer);
+
+        let scheduled_resize_deadline = resize_deadline;
+        let resize_timer = async {
+            if let Some(deadline) = scheduled_resize_deadline {
+                tokio::time::sleep_until(deadline).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        }
+        .fuse();
+        tokio::pin!(resize_timer);
 
         tokio::select! {
             // --- SIGINT (external kill -INT) ---
@@ -442,12 +492,16 @@ async fn enter_event_loop(
                         ));
                         needs_status_redraw = true;
                     }
+                    Ok(RenderInfo::Notice(text)) => {
+                        app.show_info(text);
+                        needs_status_redraw = true;
+                    }
                     Err(e) => {
-                        if app.n_pages == 0 {
-                            log::warn!("startup render error: {e}");
-                            return Err(anyhow::anyhow!(startup_render_error_message(path, &e)));
+                        if handle_render_error(app, &to_renderer, &to_converter, path, e)? {
+                            needs_redraw = true;
+                        } else {
+                            needs_status_redraw = true;
                         }
-                        app.show_render_error(e);
                     }
                 }
             }
@@ -462,7 +516,10 @@ async fn enter_event_loop(
                         }
                         app.page_converted(page)
                     }
-                    Err(e) => app.show_render_error(e),
+                    Err(e) => {
+                        app.show_render_error(e);
+                        needs_status_redraw = true;
+                    }
                 }
             }
 
@@ -478,17 +535,26 @@ async fn enter_event_loop(
                     loading_page = None;
                 }
             }
-        }
 
-        // Detect terminal resize.
-        if let Ok(new_ws) = get_window_size() {
-            let size_changed = new_ws.rows != ws.rows || new_ws.cols != ws.cols;
-            if size_changed {
-                *ws = new_ws;
+            // --- Debounced resize flush ---
+            _ = &mut resize_timer => {
+                resize_deadline = None;
                 to_renderer.send(RenderNotif::Area {
                     width_px: render_width_px(app, ws),
                     height_px: render_height_px(app, ws),
                 })?;
+                needs_redraw = true;
+            }
+        }
+
+        // Detect terminal resize. Update the local window size immediately (so the redraw
+        // uses it), but debounce the renderer Area notification so a drag coalesces into a
+        // single relayout/re-render once the size settles.
+        if let Ok(new_ws) = get_window_size() {
+            let size_changed = new_ws.rows != ws.rows || new_ws.cols != ws.cols;
+            if size_changed {
+                *ws = new_ws;
+                resize_deadline = Some(tokio::time::Instant::now() + RESIZE_DEBOUNCE);
                 needs_redraw = true;
             }
         }
@@ -568,6 +634,30 @@ fn startup_render_error_message(path: &Path, err: &RenderError) -> String {
         }
         _ => err.to_string(),
     }
+}
+
+fn handle_render_error(
+    app: &mut App,
+    to_renderer: &Sender<RenderNotif>,
+    to_converter: &Sender<ConverterMsg>,
+    path: &Path,
+    err: RenderError,
+) -> anyhow::Result<bool> {
+    if app.n_pages == 0 {
+        log::warn!("startup render error: {err}");
+        return Err(anyhow::anyhow!(startup_render_error_message(path, &err)));
+    }
+
+    let mut needs_redraw = false;
+    if let RenderError::Panicked { page, .. } = &err {
+        app.got_search_results(*page, 0);
+        if advance_pending_search_if_ready(app, to_renderer, to_converter)? {
+            needs_redraw = true;
+        }
+    }
+
+    app.show_render_error(err);
+    Ok(needs_redraw)
 }
 
 fn current_page_is_ready(app: &App) -> bool {
@@ -983,7 +1073,7 @@ async fn handle_event(
                 return Ok(EventOutcome::Redraw);
             }
             app.toggle_zoom_mode();
-            app.invalidate_all_pages();
+            app.invalidate_all_pages_keep_stale();
             to_renderer.send(RenderNotif::Area {
                 width_px: render_width_px(app, ws),
                 height_px: render_height_px(app, ws),
@@ -993,7 +1083,7 @@ async fn handle_event(
         }
         KeyCode::Char('o') if app.zoom_mode => {
             if app.zoom_in() {
-                app.invalidate_all_pages();
+                app.invalidate_all_pages_keep_stale();
                 to_renderer.send(RenderNotif::Area {
                     width_px: render_width_px(app, ws),
                     height_px: render_height_px(app, ws),
@@ -1004,7 +1094,7 @@ async fn handle_event(
         }
         KeyCode::Char('O') if app.zoom_mode => {
             if app.zoom_out() {
-                app.invalidate_all_pages();
+                app.invalidate_all_pages_keep_stale();
                 to_renderer.send(RenderNotif::Area {
                     width_px: render_width_px(app, ws),
                     height_px: render_height_px(app, ws),
@@ -1019,7 +1109,7 @@ async fn handle_event(
         }
         KeyCode::Char('<') => {
             if matches!(app.document_kind, DocumentKind::Reflowable) {
-                app.invalidate_all_pages();
+                app.invalidate_all_pages_keep_stale();
                 to_renderer.send(RenderNotif::AdjustFontSize(-1))?;
                 app.show_info("EPUB font smaller".to_owned());
             } else {
@@ -1028,7 +1118,7 @@ async fn handle_event(
         }
         KeyCode::Char('>') => {
             if matches!(app.document_kind, DocumentKind::Reflowable) {
-                app.invalidate_all_pages();
+                app.invalidate_all_pages_keep_stale();
                 to_renderer.send(RenderNotif::AdjustFontSize(1))?;
                 app.show_info("EPUB font larger".to_owned());
             } else {
@@ -1344,15 +1434,15 @@ struct PageSurface {
 }
 
 impl PageSurface {
-    fn display_location(self) -> kittage::display::DisplayLocation {
-        kittage::display::DisplayLocation {
+    fn display_location(self) -> kitty::display::DisplayLocation {
+        kitty::display::DisplayLocation {
             x: self.src_x,
             y: self.src_y,
             width: self.src_w,
             height: self.src_h,
             columns: self.display_cols,
             rows: self.display_rows,
-            ..kittage::display::DisplayLocation::default()
+            ..kitty::display::DisplayLocation::default()
         }
     }
 
@@ -1475,7 +1565,7 @@ fn compute_page_surface(
 }
 
 async fn clear_visible_image(
-    displayed_image_id: &mut Option<kittage::ImageId>,
+    displayed_image_id: &mut Option<kitty::ImageId>,
     ev_stream: &mut EventStream,
     app: &mut App,
 ) {
@@ -1484,7 +1574,7 @@ async fn clear_visible_image(
     };
 
     if let Err(err) = clear_kitty_image(image_id, ev_stream).await {
-        use kittage::error::{TerminalError, TransmitError};
+        use kitty::error::{TerminalError, TransmitError};
         if !matches!(err, TransmitError::Terminal(TerminalError::NoEntity(_))) {
             app.show_render_error(RenderError::Converting(err.to_string()));
         }
@@ -1504,7 +1594,7 @@ async fn draw(
     ev_stream: &mut EventStream,
     to_renderer: &Sender<RenderNotif>,
     last_drawn_surface: &mut Option<DrawSurface>,
-    displayed_image_id: &mut Option<kittage::ImageId>,
+    displayed_image_id: &mut Option<kitty::ImageId>,
 ) -> anyhow::Result<()> {
     let draw_started = Instant::now();
     execute!(stdout(), BeginSynchronizedUpdate)?;
@@ -1513,7 +1603,7 @@ async fn draw(
 
     let stale_image_ids = std::mem::take(&mut app.pending_image_deletes);
     if let Err(err) = delete_kitty_images(stale_image_ids, ev_stream).await {
-        use kittage::error::{TerminalError, TransmitError};
+        use kitty::error::{TerminalError, TransmitError};
         if !matches!(err, TransmitError::Terminal(TerminalError::NoEntity(_))) {
             app.show_render_error(RenderError::Converting(err.to_string()));
         }
@@ -1611,7 +1701,7 @@ async fn draw(
     let mut had_display_error = false;
     if let Err((failed_pages, _desc, err)) = maybe_err {
         had_display_error = true;
-        use kittage::error::{TerminalError, TransmitError};
+        use kitty::error::{TerminalError, TransmitError};
         match err {
             // Kitty/Ghostty evicted the image under memory pressure — silently re-render.
             TransmitError::Terminal(TerminalError::NoEntity(_)) => {}
@@ -1803,6 +1893,79 @@ mod tests {
             startup_render_error_message(Path::new("fake.txt"), &RenderError::EmptyDocument),
             "not a valid document file"
         );
+    }
+
+    #[test]
+    fn panicked_render_error_marks_search_page_and_advances_pending_search() {
+        let (to_renderer, renderer_rx) = flume::unbounded();
+        let (to_converter, converter_rx) = flume::unbounded();
+        let mut app = App::new();
+        app.set_n_pages(3);
+        app.search_term = Some("needle".to_owned());
+        app.pending_search_jump_from = Some(0);
+        app.rendered[0].num_results = Some(0);
+        app.rendered[1].num_results = None;
+        app.rendered[2].num_results = Some(1);
+
+        let needs_redraw = handle_render_error(
+            &mut app,
+            &to_renderer,
+            &to_converter,
+            Path::new("fake.pdf"),
+            RenderError::Panicked {
+                page: 1,
+                message: "boom".to_owned(),
+            },
+        )
+        .unwrap();
+
+        assert!(needs_redraw);
+        assert_eq!(app.rendered[1].num_results, Some(0));
+        assert_eq!(app.pending_search_jump_from, None);
+        assert_eq!(app.page, 2);
+        assert!(matches!(
+            app.msg,
+            StatusMsg::Error(ref msg)
+                if msg == "rendering page 2 failed: boom"
+        ));
+
+        match renderer_rx.try_recv().unwrap() {
+            RenderNotif::JumpToPage(2) => {}
+            other => panic!("expected jump to page 2, got {other:?}"),
+        }
+        match renderer_rx.try_recv().unwrap() {
+            RenderNotif::PageNeedsReRender(2) => {}
+            other => panic!("expected page 2 rerender, got {other:?}"),
+        }
+        match converter_rx.try_recv().unwrap() {
+            ConverterMsg::GoToPage(2) => {}
+            _ => panic!("expected converter jump to page 2"),
+        }
+    }
+
+    #[test]
+    fn render_error_without_pending_search_is_status_only() {
+        let (to_renderer, renderer_rx) = flume::unbounded();
+        let (to_converter, converter_rx) = flume::unbounded();
+        let mut app = App::new();
+        app.set_n_pages(1);
+
+        let needs_redraw = handle_render_error(
+            &mut app,
+            &to_renderer,
+            &to_converter,
+            Path::new("fake.pdf"),
+            RenderError::Converting("bad pixels".to_owned()),
+        )
+        .unwrap();
+
+        assert!(!needs_redraw);
+        assert!(matches!(
+            app.msg,
+            StatusMsg::Error(ref msg) if msg == "conversion error: bad pixels"
+        ));
+        assert!(renderer_rx.try_recv().is_err());
+        assert!(converter_rx.try_recv().is_err());
     }
 
     #[test]

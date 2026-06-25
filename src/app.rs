@@ -3,11 +3,11 @@
 use crate::{
     error::RenderError,
     image_pipeline::{ConvertedPage, MaybeTransferred},
+    kitty::ImageId,
     perf,
     renderer::{DocumentKind, LinkInfo, TocEntry, fill_default},
     terminal::WindowSize,
 };
-use kittage::ImageId;
 
 // ---------------------------------------------------------------------------
 // Status bar message
@@ -191,6 +191,16 @@ impl App {
         if deleted > 0 || log::log_enabled!(log::Level::Debug) {
             perf::log_cache_state("app_cache_drop", 0, 0, deleted);
         }
+        self.needs_redraw = true;
+    }
+
+    /// Request a redraw/re-render for a geometry-only change (zoom, resize, EPUB font
+    /// reflow) WITHOUT dropping the current page images. Image IDs are stable per page, so
+    /// the existing (now-stale) image keeps displaying — scaled by the terminal — until the
+    /// fresh render overwrites it in place. This avoids blanking to "Loading…" on every
+    /// zoom step. Use [`Self::invalidate_all_pages`] instead when the pixel content itself
+    /// changes (invert, tint, rotate), where a stale frame would mislead.
+    pub fn invalidate_all_pages_keep_stale(&mut self) {
         self.needs_redraw = true;
     }
 
@@ -977,6 +987,18 @@ mod tests {
         app.invalidate_all_pages();
         assert!(app.rendered.iter().all(|r| r.converted.is_none()));
         assert_eq!(app.pending_image_deletes.len(), 3);
+        assert!(app.needs_redraw);
+    }
+
+    #[test]
+    fn invalidate_keep_stale_retains_images_for_seamless_zoom() {
+        let mut app = app_with_pages(3, 0, 800, 480);
+        assert!(app.rendered[0].converted.is_some());
+        app.invalidate_all_pages_keep_stale();
+        // Stale images stay displayable (stable IDs overwrite in place on re-render) and
+        // nothing is queued for deletion, so the view never blanks to "Loading…".
+        assert!(app.rendered.iter().all(|r| r.converted.is_some()));
+        assert!(app.pending_image_deletes.is_empty());
         assert!(app.needs_redraw);
     }
 

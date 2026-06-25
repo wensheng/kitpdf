@@ -1,15 +1,8 @@
 # kitpdf
 
-A terminal PDF and EPUB viewer that renders documents using the
+A terminal-based PDF and EPUB viewer that renders documents using the
 [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/).
 Written in Rust for speed and sharp rendering at any zoom level.
-
-(Part of kit* series of graphic terminal apps:
-[kitim](https://github.com/wensheng/kitim)
-[kitmd](https://github.com/wensheng/kitmd)
-[kitpdf](https://github.com/wensheng/kitpdf)
-[kitdraw](https://github.com/wensheng/kitdraw)
-[kitDOOM](https://github.com/wensheng/kitdoom))
 
 It runs in a terminal that supports the Kitty graphics protocol:
 - [Ghostty](https://ghostty.org/)

@@ -1,5 +1,5 @@
 // Async image pipeline: receives raw RGB pages from the renderer, converts them to
-// kittage Kitty images, and sends them to the main loop for display.
+// Kitty graphics images, and sends them to the main loop for display.
 
 use std::{
     collections::HashMap,
@@ -11,11 +11,11 @@ use std::{
 use flume::{Receiver, SendError, Sender, TryRecvError};
 use futures_util::stream::StreamExt as _;
 use image::{DynamicImage, RgbImage};
-use kittage::{ImageId, NumberOrId};
 use rayon::prelude::*;
 
 use crate::{
     error::RenderError,
+    kitty::{ImageId, NumberOrId, image::Image},
     perf,
     renderer::{HighlightRect, PageInfo},
 };
@@ -108,9 +108,9 @@ impl Iterator for InterleavedAroundWithMax {
 #[derive(Debug)]
 pub enum MaybeTransferred {
     /// Image data ready to transmit for the first time.
-    NotYet(kittage::image::Image<'static>),
+    NotYet(Image<'static>),
     /// Image already in Kitty's memory; use this ID to re-display.
-    Transferred(kittage::ImageId),
+    Transferred(ImageId),
 }
 
 impl MaybeTransferred {
@@ -559,10 +559,10 @@ fn convert_page_info(
         let shm_name = format!("/kitpdf_{pid}_{rn}_{page_num}");
         #[cfg(unix)]
         let shm_name = &*shm_name;
-        kittage::image::Image::shm_from(DynamicImage::ImageRgb8(final_img), shm_name)
+        Image::shm_from(DynamicImage::ImageRgb8(final_img), shm_name)
             .map_err(|e| RenderError::Converting(format!("cannot create shm: {e:?}")))?
     } else {
-        kittage::image::Image::from(DynamicImage::ImageRgb8(final_img))
+        Image::from(DynamicImage::ImageRgb8(final_img))
     };
 
     // Assign a stable per-page ID (1-indexed since 0 is invalid).
