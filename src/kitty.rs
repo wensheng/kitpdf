@@ -233,7 +233,7 @@ pub mod event_stream {
         time::Duration,
     };
 
-    use crossterm::event::{Event, EventStream, KeyModifiers};
+    use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use futures_util::Stream;
 
     use super::AsyncInputReader;
@@ -271,16 +271,8 @@ pub mod event_stream {
                         None => return Ok(()),
                         Some(Err(e)) => return Err(e),
                         Some(Ok(Event::Key(k))) => {
-                            if let Some(c) = k.code.as_char() {
-                                if k.modifiers.contains(KeyModifiers::ALT) {
-                                    if !found_one_esc {
-                                        found_one_esc = true;
-                                    } else {
-                                        return Ok(());
-                                    }
-                                }
-
-                                buf.push(c);
+                            if append_reply_key(buf, &mut found_one_esc, k) {
+                                return Ok(());
                             }
                         }
                         Some(Ok(Event::Paste(s))) => match s.find('\x1b') {
@@ -297,6 +289,32 @@ pub mod event_stream {
             .await?
             .map_err(InputErr::from)
         }
+    }
+
+    fn append_reply_key(buf: &mut String, found_escape: &mut bool, key: KeyEvent) -> bool {
+        if key.kind == KeyEventKind::Release {
+            return false;
+        }
+        if key.code == KeyCode::Esc || key.modifiers.contains(KeyModifiers::ALT) {
+            if *found_escape {
+                return true;
+            }
+            *found_escape = true;
+        }
+        if let Some(ch) = key.code.as_char() {
+            // WinAPI key events can omit ESC from ST, leaving the final backslash.
+            #[cfg(windows)]
+            if ch == '\\' && buf.starts_with("_G") {
+                return true;
+            }
+            // Replies contain identifiers and a short status, never media payloads.
+            const MAX_REPLY_BYTES: usize = 4096;
+            if buf.len() + ch.len_utf8() > MAX_REPLY_BYTES {
+                return true;
+            }
+            buf.push(ch);
+        }
+        false
     }
 
     struct Next<'a>(Option<&'a mut EventStream>);
@@ -319,6 +337,77 @@ pub mod event_stream {
     }
 
     impl Unpin for Next<'_> where EventStream: Unpin {}
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn release_events_do_not_duplicate_or_terminate_a_reply() {
+            let mut output = String::new();
+            let mut escaped = false;
+            let key = KeyEvent::new(KeyCode::Char('_'), KeyModifiers::ALT);
+            assert!(!append_reply_key(&mut output, &mut escaped, key));
+            let release = KeyEvent::new_with_kind(key.code, key.modifiers, KeyEventKind::Release);
+            assert!(!append_reply_key(&mut output, &mut escaped, release));
+            assert_eq!(output, "_");
+            assert!(!append_reply_key(
+                &mut output,
+                &mut escaped,
+                KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE),
+            ));
+            assert!(append_reply_key(
+                &mut output,
+                &mut escaped,
+                KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::ALT),
+            ));
+            assert_eq!(output, "_G");
+        }
+
+        #[test]
+        fn separate_escape_keys_delimit_a_reply() {
+            let mut output = String::new();
+            let mut escaped = false;
+            assert!(!append_reply_key(
+                &mut output,
+                &mut escaped,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            ));
+            for ch in "_Gi=1;OK".chars() {
+                assert!(!append_reply_key(
+                    &mut output,
+                    &mut escaped,
+                    KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                ));
+            }
+            assert!(append_reply_key(
+                &mut output,
+                &mut escaped,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            ));
+            assert_eq!(output, "_Gi=1;OK");
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn windows_reply_without_escape_records_ends_at_st_backslash() {
+            let mut output = String::new();
+            let mut escaped = false;
+            for ch in "_Gi=4294967294;OK".chars() {
+                assert!(!append_reply_key(
+                    &mut output,
+                    &mut escaped,
+                    KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                ));
+            }
+            assert!(append_reply_key(
+                &mut output,
+                &mut escaped,
+                KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::NONE),
+            ));
+            assert_eq!(output, "_Gi=4294967294;OK");
+        }
+    }
 }
 
 pub mod medium {
@@ -339,6 +428,7 @@ pub mod medium {
             chunk_size: Option<ChunkSize>,
             data: Cow<'data, [u8]>,
         },
+        #[cfg(unix)]
         SharedMemObject(SharedMemObject),
     }
 
@@ -349,12 +439,13 @@ pub mod medium {
         map: memmap2::MmapMut,
     }
 
+    #[cfg(unix)]
     #[derive(Debug)]
     pub struct SharedMemObject {
-        #[cfg(unix)]
         inner: UnixShm,
     }
 
+    #[cfg(unix)]
     impl PartialEq for SharedMemObject {
         fn eq(&self, other: &Self) -> bool {
             self.name() == other.name()
@@ -398,8 +489,8 @@ pub mod medium {
         MemmapCreation,
     }
 
+    #[cfg(unix)]
     impl SharedMemObject {
-        #[cfg(unix)]
         pub fn create_new(name: &str, size: usize) -> Result<Self, ShmError> {
             use psx_shm::UnlinkOnDrop;
             use rustix::{fs::Mode, shm::OFlags};
@@ -434,47 +525,29 @@ pub mod medium {
         }
 
         fn name(&self) -> Box<str> {
-            #[cfg(unix)]
-            {
-                self.inner.shm.shm.name().into()
-            }
-            #[cfg(not(unix))]
-            {
-                unreachable!("shared memory transfer is only implemented on unix")
-            }
+            self.inner.shm.shm.name().into()
         }
 
         pub fn copy_in_buf(&mut self, buf: &[u8]) -> std::io::Result<()> {
-            #[cfg(unix)]
-            {
-                use std::cmp::Ordering;
+            use std::cmp::Ordering;
 
-                match buf.len().cmp(&self.inner.map.as_ref().len()) {
-                    Ordering::Less => {
-                        self.inner.map[..buf.len()].copy_from_slice(buf);
-                        for byte in &mut self.inner.map[buf.len()..] {
-                            *byte = 0;
-                        }
-                    }
-                    Ordering::Equal => self.inner.map.copy_from_slice(buf),
-                    Ordering::Greater => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            "Provided buffer is too large to fit",
-                        ));
+            match buf.len().cmp(&self.inner.map.as_ref().len()) {
+                Ordering::Less => {
+                    self.inner.map[..buf.len()].copy_from_slice(buf);
+                    for byte in &mut self.inner.map[buf.len()..] {
+                        *byte = 0;
                     }
                 }
+                Ordering::Equal => self.inner.map.copy_from_slice(buf),
+                Ordering::Greater => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Provided buffer is too large to fit",
+                    ));
+                }
+            }
 
-                Ok(())
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = buf;
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "shared memory transfer is only implemented on unix",
-                ))
-            }
+            Ok(())
         }
     }
 
@@ -514,6 +587,7 @@ pub mod medium {
 
     impl Medium<'_> {
         pub(crate) fn write_data<W: Write>(&self, mut writer: W) -> std::io::Result<W> {
+            #[cfg(unix)]
             let name: Box<str>;
             let (key, data) = match self {
                 Self::Direct { data, chunk_size } => {
@@ -541,6 +615,7 @@ pub mod medium {
 
                     ('d', &**data)
                 }
+                #[cfg(unix)]
                 Self::SharedMemObject(obj) => {
                     name = obj.name();
                     ('s', name.as_bytes())
@@ -750,6 +825,7 @@ pub mod image {
     }
 
     #[derive(Debug, thiserror::Error)]
+    #[cfg(unix)]
     pub enum ImageFromShmFailureStep<E>
     where
         E: core::fmt::Display,
@@ -1412,6 +1488,11 @@ pub async fn run_action(
     action: Action<'_, '_>,
     ev_stream: &mut EventStream,
 ) -> Result<Option<ImageId>, TransmitError<InputErr>> {
+    // Enable VT only while receiving a protocol reply. Ordinary input uses
+    // crossterm's native Windows keyboard and mouse events.
+    #[cfg(windows)]
+    let _input_mode = crate::terminal::enable_terminal_replies()
+        .map_err(|e| TransmitError::ReadingInput(InputErr::IO(e)))?;
     if tmux_passthrough_needed() {
         let writer = DbgWriter {
             w: TmuxWriter::new(std::io::stdout().lock()),
@@ -1459,6 +1540,7 @@ pub async fn supports_kitty_graphics(ev_stream: &mut EventStream) -> bool {
 
 /// Test whether shared-memory image transfer works in this terminal.
 /// Returns `true` if SHM is supported (Kitty/Ghostty on Linux/macOS).
+#[cfg(unix)]
 pub async fn do_shms_work(ev_stream: &mut EventStream) -> bool {
     let img = DynamicImage::new_rgb8(1, 1);
     let pid = std::process::id();
@@ -1476,6 +1558,11 @@ pub async fn do_shms_work(ev_stream: &mut EventStream) -> bool {
     // Raw mode must already be enabled by TerminalGuard before calling this.
     let res = run_action(Action::Query(&k_img), ev_stream).await;
     res.is_ok()
+}
+
+#[cfg(not(unix))]
+pub async fn do_shms_work(_ev_stream: &mut EventStream) -> bool {
+    false
 }
 
 // ---------------------------------------------------------------------------

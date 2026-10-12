@@ -21,6 +21,20 @@ If you are on Linux, make sure `clang` and `libfontconfig` are installed.
 sudo apt install clang libfontconfig1-dev
 ```
 
+### Building from source on Windows
+
+Install Rust's MSVC toolchain, Visual Studio C++ Build Tools (including the
+Windows SDK), CMake, and LLVM/Clang for MuPDF, then run:
+
+```powershell
+cargo build --release
+.\target\release\kitpdf.exe document.pdf
+```
+
+Source builds include a small MuPDF 0.8.0 compatibility patch for MSVC.
+Windows uses direct Kitty image transfer; POSIX shared-memory transfer remains
+available on Unix terminals that support it.
+
 ## Usage
 
 ```

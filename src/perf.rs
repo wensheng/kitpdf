@@ -1,9 +1,9 @@
-use std::{
-    mem::MaybeUninit,
-    time::{Duration, Instant},
-};
+#[cfg(unix)]
+use std::mem::MaybeUninit;
+use std::time::{Duration, Instant};
 
 /// Return the process peak RSS in bytes, if the platform exposes it.
+#[cfg(unix)]
 pub fn peak_rss_bytes() -> Option<u64> {
     let mut usage = MaybeUninit::<nix::libc::rusage>::zeroed();
     // SAFETY: `usage` points to valid writable memory for `getrusage`.
@@ -24,6 +24,11 @@ pub fn peak_rss_bytes() -> Option<u64> {
     {
         Some((usage.ru_maxrss as u64).saturating_mul(1024))
     }
+}
+
+#[cfg(not(unix))]
+pub fn peak_rss_bytes() -> Option<u64> {
+    None
 }
 
 fn fmt_duration_ms(elapsed: Duration) -> String {

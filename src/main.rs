@@ -161,8 +161,7 @@ fn horizontal_action(key: KeyCode, zoom_mode: bool) -> Option<HorizontalAction> 
 fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(3)
-        .enable_time()
-        .enable_io()
+        .enable_all()
         .build()?;
 
     rt.block_on(async move { inner_main().await })
@@ -209,7 +208,7 @@ async fn inner_main() -> anyhow::Result<()> {
     }
 
     // --- Terminal setup ---------------------------------------------------
-    let ws = get_window_size()?;
+    let ws = get_window_size(None)?;
 
     let _guard = TerminalGuard::enter()?;
 
@@ -372,6 +371,10 @@ async fn inner_main() -> anyhow::Result<()> {
 // Event loop
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Coordinates renderer, converter, and terminal state"
+)]
 async fn enter_event_loop(
     ev_stream: &mut EventStream,
     to_renderer: Sender<RenderNotif>,
@@ -398,7 +401,8 @@ async fn enter_event_loop(
     let mut last_drawn_surface: Option<DrawSurface> = None;
     let mut displayed_image_id: Option<kitty::ImageId> = None;
 
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let sigint = tokio::signal::ctrl_c();
+    tokio::pin!(sigint);
 
     loop {
         let next_ev = ev_stream.next().fuse();
@@ -425,8 +429,9 @@ async fn enter_event_loop(
         tokio::pin!(resize_timer);
 
         tokio::select! {
-            // --- SIGINT (external kill -INT) ---
-            _ = sigint.recv() => {
+            // --- Console interrupt / Unix SIGINT ---
+            result = &mut sigint => {
+                result?;
                 return Ok(());
             }
 
@@ -550,7 +555,7 @@ async fn enter_event_loop(
         // Detect terminal resize. Update the local window size immediately (so the redraw
         // uses it), but debounce the renderer Area notification so a drag coalesces into a
         // single relayout/re-render once the size settles.
-        if let Ok(new_ws) = get_window_size() {
+        if let Ok(new_ws) = get_window_size(Some(*ws)) {
             let size_changed = new_ws.rows != ws.rows || new_ws.cols != ws.cols;
             if size_changed {
                 *ws = new_ws;
@@ -559,11 +564,10 @@ async fn enter_event_loop(
             }
         }
 
-        if current_page_is_ready(app) || !matches!(app.input_mode, InputMode::Normal) {
-            loading_deadline = None;
-            loading_page = None;
-            show_loading_for_page = None;
-        } else if loading_page.is_some_and(|page| page != app.page) {
+        if current_page_is_ready(app)
+            || !matches!(app.input_mode, InputMode::Normal)
+            || loading_page.is_some_and(|page| page != app.page)
+        {
             loading_deadline = None;
             loading_page = None;
             show_loading_for_page = None;

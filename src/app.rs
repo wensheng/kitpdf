@@ -39,20 +39,12 @@ impl StatusMsg {
 // Per-page display state
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
 pub struct RenderedPageInfo {
     /// The converted Kitty image ready for display, if available.
     pub converted: Option<ConvertedPage>,
     /// Number of search results on this page, if known.
     pub num_results: Option<usize>,
-}
-
-impl Default for RenderedPageInfo {
-    fn default() -> Self {
-        Self {
-            converted: None,
-            num_results: None,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -545,10 +537,10 @@ impl App {
 
         let mut evicted = 0usize;
         for (idx, info) in self.rendered.iter_mut().enumerate() {
-            if !keep.contains(&idx) {
-                if take_converted_for_delete(&mut info.converted, &mut self.pending_image_deletes) {
-                    evicted += 1;
-                }
+            if !keep.contains(&idx)
+                && take_converted_for_delete(&mut info.converted, &mut self.pending_image_deletes)
+            {
+                evicted += 1;
             }
         }
 

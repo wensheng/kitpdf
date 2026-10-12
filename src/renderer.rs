@@ -402,9 +402,6 @@ pub fn start_rendering(
     let heartbeat = RenderHeartbeat::new();
     spawn_render_watchdog(Arc::clone(&heartbeat), sender.clone());
 
-    #[cfg(windows)]
-    let path = path.to_string_lossy();
-
     'document: loop {
         let (area_w, area_h) = match preserved_area {
             Some(area) => area,
@@ -435,8 +432,7 @@ pub fn start_rendering(
             },
         };
 
-        #[cfg_attr(unix, allow(clippy::borrow_deref_ref))]
-        let mut doc = match Document::open(&*path) {
+        let mut doc = match open_document(path) {
             Err(e) => {
                 sender.send(Err(RenderError::Mupdf(e)))?;
                 if !document_ready {
@@ -965,8 +961,7 @@ pub fn export_document_page(
     path: &Path,
     options: ExportOptions<'_>,
 ) -> Result<PathBuf, RenderError> {
-    #[cfg_attr(unix, allow(clippy::borrow_deref_ref))]
-    let mut doc = Document::open(&*path)?;
+    let mut doc = open_document(path)?;
 
     let doc_kind = match doc.is_reflowable() {
         Ok(true) => DocumentKind::Reflowable,
@@ -1086,9 +1081,15 @@ fn export_page(
     export::write_png(output_path, &final_img)
 }
 
+fn open_document(path: &Path) -> Result<Document, mupdf::Error> {
+    // MuPDF requires UTF-8 on Windows and accepts native path bytes on Unix.
+    #[cfg(windows)]
+    let path = path.to_str().ok_or(mupdf::Error::InvalidUtf8)?;
+    Document::open(path)
+}
+
 pub fn probe_document(path: &Path) -> Result<(), RenderError> {
-    #[cfg_attr(unix, allow(clippy::borrow_deref_ref))]
-    let mut doc = Document::open(&*path)?;
+    let mut doc = open_document(path)?;
 
     let doc_kind = match doc.is_reflowable() {
         Ok(true) => DocumentKind::Reflowable,
@@ -1531,9 +1532,9 @@ mod tests {
     #[test]
     fn epub_layout_uses_book_like_width() {
         let (w, h, em) = epub_layout_for_area(1200.0, 700.0, 10, 20);
-        assert!(w >= EPUB_LAYOUT_MIN_W && w <= EPUB_LAYOUT_MAX_W);
+        assert!((EPUB_LAYOUT_MIN_W..=EPUB_LAYOUT_MAX_W).contains(&w));
         assert!(h > w);
-        assert!(em >= EPUB_EM_MIN && em <= EPUB_EM_MAX);
+        assert!((EPUB_EM_MIN..=EPUB_EM_MAX).contains(&em));
         assert!(
             w < 500.0,
             "epub layout width should not match raw terminal pixels"
@@ -1656,11 +1657,11 @@ mod tests {
     }
 
     #[test]
-    fn export_document_page_writes_png_for_sample_pdf_when_available() {
-        let input = PathBuf::from("../data/2511.08880v1.pdf");
-        if !input.exists() {
-            return;
-        }
+    fn export_document_page_writes_png_from_unicode_path() {
+        let input = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sample-文档.pdf"
+        ));
 
         let dir = std::env::temp_dir().join(format!(
             "kitpdf-export-smoke-{}-{}",
@@ -1693,6 +1694,9 @@ mod tests {
         let bytes = fs::read(&output).unwrap();
 
         assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        let image = image::load_from_memory(&bytes).unwrap().to_rgb8();
+        let center = image.get_pixel(image.width() / 2, image.height() / 2);
+        assert!(center[0] > 200 && center[1] < 60 && center[2] < 80);
         assert!(
             output
                 .file_name()

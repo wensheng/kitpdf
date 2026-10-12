@@ -1,11 +1,12 @@
 // Async image pipeline: receives raw RGB pages from the renderer, converts them to
 // Kitty graphics images, and sends them to the main loop for display.
 
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     collections::HashMap,
     num::{NonZeroU32, NonZeroUsize},
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use flume::{Receiver, SendError, Sender, TryRecvError};
@@ -533,8 +534,8 @@ fn dequeue_next_page(
 
 fn convert_page_info(
     page_info: PageInfo,
-    pid: u32,
-    shms_work: bool,
+    _pid: u32,
+    _shms_work: bool,
     auto_crop: bool,
 ) -> Result<ConvertedPage, RenderError> {
     let convert_started = std::time::Instant::now();
@@ -548,22 +549,24 @@ fn convert_page_info(
     let final_w = final_img.width();
     let final_h = final_img.height();
 
-    // Generate a unique name for shared memory segments.
-    let rn = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        % 1_000_000;
-
-    let mut img = if shms_work {
-        let shm_name = format!("/kitpdf_{pid}_{rn}_{page_num}");
-        #[cfg(unix)]
-        let shm_name = &*shm_name;
-        Image::shm_from(DynamicImage::ImageRgb8(final_img), shm_name)
+    let image = DynamicImage::ImageRgb8(final_img);
+    #[cfg(unix)]
+    let mut img = if _shms_work {
+        // Generate a unique name for shared memory segments.
+        let rn = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            % 1_000_000;
+        let shm_name = format!("/kitpdf_{_pid}_{rn}_{page_num}");
+        Image::shm_from(image, &shm_name)
             .map_err(|e| RenderError::Converting(format!("cannot create shm: {e:?}")))?
     } else {
-        Image::from(DynamicImage::ImageRgb8(final_img))
+        Image::from(image)
     };
+    // Kitty's POSIX shared-memory transport is unavailable on Windows.
+    #[cfg(not(unix))]
+    let mut img = Image::from(image);
 
     // Assign a stable per-page ID (1-indexed since 0 is invalid).
     img.num_or_id = NumberOrId::Id(NonZeroU32::new(1).unwrap().saturating_add(page_num as u32));
@@ -620,9 +623,8 @@ pub async fn run_conversion_loop(
                 break;
             };
 
-            let converted = tokio::task::spawn_blocking({
-                let page_info = page_info;
-                move || convert_page_info(page_info, pid, shms_work, auto_crop)
+            let converted = tokio::task::spawn_blocking(move || {
+                convert_page_info(page_info, pid, shms_work, auto_crop)
             })
             .await
             .map_err(|e| RenderError::Converting(format!("converter worker failed to join: {e}")))
@@ -733,6 +735,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn converted_page_preserves_direct_rgb_pixels_and_page_id() {
+        let pixels = vec![255, 0, 0, 0, 255, 0];
+        let converted = convert_page_info(
+            PageInfo {
+                page_num: 2,
+                img_data: crate::renderer::ImageData {
+                    pixels: pixels.clone(),
+                    width: 2,
+                    height: 1,
+                    row_stride: 6,
+                },
+                result_rects: Vec::new(),
+            },
+            std::process::id(),
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!((converted.pixel_w, converted.pixel_h), (2, 1));
+        let MaybeTransferred::NotYet(img) = converted.img else {
+            panic!("converted image must await transfer");
+        };
+        assert_eq!(img.num_or_id, NumberOrId::Id(NonZeroU32::new(3).unwrap()));
+        match img.medium {
+            crate::kitty::medium::Medium::Direct { data, .. } => {
+                assert_eq!(data.as_ref(), pixels);
+            }
+            #[cfg(unix)]
+            _ => panic!("shared memory was disabled"),
+        }
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn converted_page_uses_direct_transfer_even_when_shm_is_requested() {
+        let converted = convert_page_info(
+            PageInfo {
+                page_num: 0,
+                img_data: raw_image_data(1, 1, 3),
+                result_rects: Vec::new(),
+            },
+            std::process::id(),
+            true,
+            false,
+        )
+        .unwrap();
+        let MaybeTransferred::NotYet(img) = converted.img else {
+            panic!("converted image must await transfer");
+        };
+        assert!(matches!(
+            img.medium,
+            crate::kitty::medium::Medium::Direct { .. }
+        ));
+    }
+
     /// Create a white image with a coloured rectangle drawn on it.
     fn white_with_rect(w: u32, h: u32, rx: u32, ry: u32, rw: u32, rh: u32) -> DynamicImage {
         let mut img = RgbImage::from_pixel(w, h, Rgb([255, 255, 255]));
@@ -751,8 +810,8 @@ mod tests {
         let cropped = crop_whitespace(img);
         let (w, h) = (cropped.width(), cropped.height());
         // Content is 50x50 + 8px margin on each side = 66x66 (clamped to image bounds)
-        assert!(w <= 66 + 2 && w >= 60, "unexpected width: {w}");
-        assert!(h <= 66 + 2 && h >= 60, "unexpected height: {h}");
+        assert!((60..=66 + 2).contains(&w), "unexpected width: {w}");
+        assert!((60..=66 + 2).contains(&h), "unexpected height: {h}");
     }
 
     #[test]

@@ -62,8 +62,6 @@ fn sanitized_stem(source_path: &Path) -> String {
     for ch in raw.chars() {
         let mapped = if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' {
             Some(ch.to_ascii_lowercase())
-        } else if ch.is_whitespace() || ch == '-' {
-            Some('-')
         } else {
             Some('-')
         };

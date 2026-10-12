@@ -37,12 +37,6 @@ flume = { version = "0.12", default-features = false, features = ["async"] }
 # Pixel-level parallelism in the image pipeline (par_enumerate_pixels_mut for search highlights)
 rayon = { version = "1", default-features = false }
 
-# Unix signal handling (SIGSTOP/Ctrl-Z)
-nix = { version = "0.31", features = ["signal"] }
-
-# Shared memory for faster Kitty image transfer
-memmap2 = "0"
-
 # Parse color config values (tint color)
 csscolorparser = { version = "0.8", default-features = false }
 
@@ -68,10 +62,25 @@ md-5 = "0.11"
 mimalloc = "0.1"
 lazy_static = "1.5.0"
 
+[target.'cfg(windows)'.dependencies]
+crossterm_winapi = "0.9.1"
+
 [target.'cfg(unix)'.dependencies]
+# Process resource usage and POSIX shared-memory image transfer.
+nix = { version = "0.31", features = ["resource", "poll"] }
+memmap2 = "0"
 psx-shm = "0.2"
 rustix = { version = "1", default-features = false, features = ["shm"] }
+
+[patch.crates-io]
+# MuPDF 0.8.0 references max_align_t, which MSVC does not expose.
+mupdf = { path = "vendor/mupdf-0.8.0" }
 
 [profile.production]
 inherits = "release"
 lto = "fat"
+
+# MuPDF's MSVC Debug configuration uses /MDd, while Rust and mimalloc use /MD.
+# Its build script selects Release at opt-level >= 2, including for cargo test.
+[profile.dev.package.mupdf-sys]
+opt-level = 2

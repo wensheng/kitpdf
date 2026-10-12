@@ -1,7 +1,10 @@
 // Terminal setup/teardown and utility drawing functions.
 // Manages raw mode, alternate screen, and window size detection without ratatui.
 
-use std::io::{BufReader, Read as _, Write as _, stdout};
+use std::{
+    io::{self, Write as _, stdout},
+    time::{Duration, Instant},
+};
 
 use anyhow::Context as _;
 use crossterm::{
@@ -9,7 +12,7 @@ use crossterm::{
     style::Print,
     terminal::{
         Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-        enable_raw_mode, window_size,
+        enable_raw_mode, is_raw_mode_enabled, window_size,
     },
 };
 
@@ -47,6 +50,43 @@ impl WindowSize {
 /// and restores the terminal on drop.
 pub struct TerminalGuard;
 
+#[cfg(windows)]
+pub(crate) struct ConsoleInputMode {
+    mode: crossterm_winapi::ConsoleMode,
+    original: u32,
+}
+
+#[cfg(windows)]
+impl ConsoleInputMode {
+    fn capture() -> io::Result<Self> {
+        let mode =
+            crossterm_winapi::ConsoleMode::from(crossterm_winapi::Handle::current_in_handle()?);
+        let original = mode.mode()?;
+        Ok(Self { mode, original })
+    }
+
+    fn enable_vt(&self) -> io::Result<()> {
+        // Preserve terminal replies instead of interpreting their APC/CSI payloads.
+        const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+        self.mode
+            .set_mode(self.mode.mode()? | ENABLE_VIRTUAL_TERMINAL_INPUT)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ConsoleInputMode {
+    fn drop(&mut self) {
+        let _ = self.mode.set_mode(self.original);
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn enable_terminal_replies() -> io::Result<ConsoleInputMode> {
+    let mode = ConsoleInputMode::capture()?;
+    mode.enable_vt()?;
+    Ok(mode)
+}
+
 impl TerminalGuard {
     pub fn enter() -> anyhow::Result<Self> {
         execute!(
@@ -82,28 +122,43 @@ pub fn reset_terminal() {
     );
 }
 
-/// Query the terminal for its dimensions in cells and pixels.
-pub fn get_window_size() -> anyhow::Result<WindowSize> {
-    let ws = window_size().context("cannot query terminal window size")?;
+// Used when neither the OS nor the terminal supplies pixel dimensions.
+const DEFAULT_CELL_SIZE: (u16, u16) = (10, 20);
+// A local terminal should answer immediately; unsupported queries must not hang startup.
+const CELL_SIZE_TIMEOUT: Duration = Duration::from_millis(200);
+const MAX_CELL_SIZE_REPLY: usize = 64;
+
+/// Query terminal geometry, reusing cell dimensions during resize checks.
+pub fn get_window_size(previous: Option<WindowSize>) -> anyhow::Result<WindowSize> {
     let (cols, rows) = crossterm::terminal::size().context("cannot query terminal cell count")?;
+    // The Windows API exposes cell counts but crossterm's pixel query is unsupported.
+    let pixels = window_size().ok().map(|ws| (ws.width, ws.height));
+    resolve_window_size(cols, rows, pixels, || {
+        previous
+            .map(|ws| (ws.cell_width_px, ws.cell_height_px))
+            .unwrap_or_else(|| query_cell_size().unwrap_or(DEFAULT_CELL_SIZE))
+    })
+}
 
-    // Some terminals don't report pixel dimensions via TIOCGWINSZ; fall back to escape sequence.
-    let (width_px, height_px) = if ws.width > 0 && ws.height > 0 && cols > 0 && rows > 0 {
-        (ws.width, ws.height)
-    } else if cols > 0 && rows > 0 {
-        match get_font_size_through_escape() {
-            Ok((cell_w, cell_h)) => (cell_w * cols, cell_h * rows),
-            Err(_) => {
-                // Best-effort fallback: assume 10×20 px cells
-                (cols * 10, rows * 20)
-            }
-        }
+fn resolve_window_size(
+    cols: u16,
+    rows: u16,
+    pixels: Option<(u16, u16)>,
+    fallback: impl FnOnce() -> (u16, u16),
+) -> anyhow::Result<WindowSize> {
+    anyhow::ensure!(cols > 0 && rows > 0, "terminal reported zero rows/cols");
+    let (width_px, cell_width_px, cell_height_px) = if let Some((width, height)) =
+        pixels.filter(|&(width, height)| width >= cols && height >= rows)
+    {
+        (width, width / cols, height / rows)
     } else {
-        anyhow::bail!("terminal reported zero rows/cols");
+        let (cell_w, cell_h) = fallback();
+        anyhow::ensure!(cell_w > 0 && cell_h > 0, "terminal reported zero cell size");
+        let width = cols
+            .checked_mul(cell_w)
+            .context("terminal pixel width overflow")?;
+        (width, cell_w, cell_h)
     };
-
-    let cell_width_px = if cols > 0 { width_px / cols } else { 10 };
-    let cell_height_px = if rows > 0 { height_px / rows } else { 20 };
 
     Ok(WindowSize {
         rows,
@@ -114,33 +169,94 @@ pub fn get_window_size() -> anyhow::Result<WindowSize> {
     })
 }
 
-/// Query cell pixel size via the `\e[14t` escape sequence
-fn get_font_size_through_escape() -> anyhow::Result<(u16, u16)> {
-    print!("\x1b[14t");
+fn query_cell_size() -> io::Result<(u16, u16)> {
+    struct RestoreRawMode(bool);
+    impl Drop for RestoreRawMode {
+        fn drop(&mut self) {
+            if self.0 {
+                let _ = disable_raw_mode();
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    let _input_mode = enable_terminal_replies()?;
+    let restore = RestoreRawMode(!is_raw_mode_enabled()?);
+    if restore.0 {
+        enable_raw_mode()?;
+    }
+    // CSI 16 t requests cell pixels; CSI 14 t requests the entire window's pixels.
+    stdout().write_all(b"\x1b[16t")?;
     stdout().flush()?;
+    let deadline = Instant::now() + CELL_SIZE_TIMEOUT;
+    let mut reply = Vec::with_capacity(MAX_CELL_SIZE_REPLY);
+    while reply.len() < MAX_CELL_SIZE_REPLY && Instant::now() < deadline {
+        let Some(byte) = read_size_reply_byte(deadline)? else {
+            break;
+        };
+        // The Windows event backend can omit the standalone ESC record.
+        #[cfg(windows)]
+        if reply.is_empty() && byte == b'[' {
+            reply.push(0x1b);
+        }
+        reply.push(byte);
+        if let Some(size) = parse_cell_size_reply(&reply) {
+            return Ok(size);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "no valid terminal cell-size reply",
+    ))
+}
 
-    enable_raw_mode()?;
+#[cfg(unix)]
+fn read_size_reply_byte(deadline: Instant) -> io::Result<Option<u8>> {
+    use nix::poll::{PollFd, PollFlags, poll};
+    use std::os::fd::AsFd as _;
 
-    let input_vec: Vec<u8> = BufReader::new(std::io::stdin())
-        .bytes()
-        .filter_map(Result::ok)
-        .take_while(|b| *b != b't')
-        .collect();
+    let input = io::stdin();
+    let mut fds = [PollFd::new(input.as_fd(), PollFlags::POLLIN)];
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let timeout = remaining.as_millis().min(u128::from(u16::MAX)) as u16;
+    if poll(&mut fds, timeout)? == 0 {
+        return Ok(None);
+    }
+    let mut byte = [0];
+    // Read the descriptor directly so stdin's buffering cannot hide bytes from poll.
+    Ok((nix::unistd::read(input.as_fd(), &mut byte)? > 0).then_some(byte[0]))
+}
 
-    disable_raw_mode()?;
+#[cfg(not(unix))]
+fn read_size_reply_byte(deadline: Instant) -> io::Result<Option<u8>> {
+    use crossterm::event::{Event, KeyCode, KeyEventKind, poll, read};
 
-    let input_line = String::from_utf8(input_vec)?;
-    let input_line = input_line
-        .trim_start_matches("\x1b[4")
-        .trim_start_matches(';');
+    while Instant::now() < deadline {
+        if !poll(deadline.saturating_duration_since(Instant::now()))? {
+            break;
+        }
+        if let Event::Key(key) = read()? {
+            if key.kind == KeyEventKind::Release {
+                continue;
+            }
+            match key.code {
+                KeyCode::Esc => return Ok(Some(0x1b)),
+                KeyCode::Char(ch) if ch.is_ascii() => return Ok(Some(ch as u8)),
+                _ => (),
+            }
+        }
+    }
+    Ok(None)
+}
 
-    // Response format: `\e[4;<height>;<width>t`
-    let mut splits = input_line.split([';', 't']);
-    let (Some(h_str), Some(w_str)) = (splits.next(), splits.next()) else {
-        anyhow::bail!("unparseable terminal size response: {input_line:?}");
-    };
-
-    Ok((w_str.parse()?, h_str.parse()?))
+fn parse_cell_size_reply(reply: &[u8]) -> Option<(u16, u16)> {
+    let text = std::str::from_utf8(reply).ok()?;
+    let start = text.find("\x1b[6;")? + "\x1b[6;".len();
+    let end = text[start..].find('t')? + start;
+    let mut parts = text[start..end].split(';');
+    let height = parts.next()?.parse::<u16>().ok()?;
+    let width = parts.next()?.parse::<u16>().ok()?;
+    (parts.next().is_none() && width > 0 && height > 0).then_some((width, height))
 }
 
 /// Draw the status bar on the last terminal row.
@@ -255,9 +371,108 @@ pub fn draw_metadata(ws: &WindowSize, metadata: &[(String, String)]) -> anyhow::
     Ok(())
 }
 
+/// Draw the links overlay (numbered list).
+pub fn draw_links(
+    ws: &WindowSize,
+    links: &[crate::renderer::LinkInfo],
+    input: &str,
+    page_num: usize,
+) -> anyhow::Result<()> {
+    let cols = ws.cols as usize;
+
+    let title = format!(" Links on page {} ({} found)", page_num + 1, links.len());
+    execute!(
+        stdout(),
+        cursor::MoveTo(0, 0),
+        crossterm::style::SetAttribute(crossterm::style::Attribute::Reverse),
+        Print(format!("{:<width$}", title, width = cols)),
+        crossterm::style::SetAttribute(crossterm::style::Attribute::Reset),
+    )?;
+
+    if links.is_empty() {
+        execute!(
+            stdout(),
+            cursor::MoveTo(2, 2),
+            Print("No links on this page."),
+        )?;
+    } else {
+        for (i, link) in links.iter().enumerate() {
+            let row = (i + 2) as u16;
+            if row >= ws.page_rows().saturating_sub(1) {
+                break;
+            }
+            let line = format!("  {}: {}", i + 1, link.text);
+            let display: String = line.chars().take(cols).collect();
+            execute!(stdout(), cursor::MoveTo(0, row), Print(display))?;
+        }
+    }
+
+    let prompt_row = ws.page_rows().saturating_sub(1);
+    let prompt = format!("Enter number to follow (Esc to cancel): {input}");
+    execute!(stdout(), cursor::MoveTo(0, prompt_row), Print(prompt))?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_pixel_query_uses_reported_cell_size() {
+        let size = resolve_window_size(80, 24, None, || (9, 19)).unwrap();
+        assert_eq!(size.width_px, 720);
+        assert_eq!(size.cell_width_px, 9);
+        assert_eq!(size.cell_height_px, 19);
+        assert_eq!(size.page_area_height_px(), 437.0);
+    }
+
+    #[test]
+    fn native_pixel_size_does_not_read_terminal_input() {
+        let size = resolve_window_size(80, 24, Some((720, 456)), || {
+            panic!("native geometry must not trigger a terminal query");
+        })
+        .unwrap();
+        assert_eq!((size.cell_width_px, size.cell_height_px), (9, 19));
+    }
+
+    #[test]
+    fn missing_pixel_size_can_use_default_cells() {
+        for pixels in [None, Some((0, 0)), Some((1, 1))] {
+            let size = resolve_window_size(80, 24, pixels, || DEFAULT_CELL_SIZE).unwrap();
+            assert_eq!(size.width_px, 800);
+            assert_eq!(size.cell_height_px, 20);
+        }
+    }
+
+    #[test]
+    fn invalid_geometry_is_rejected_before_arithmetic() {
+        assert!(resolve_window_size(0, 24, None, || DEFAULT_CELL_SIZE).is_err());
+        assert!(resolve_window_size(80, 0, None, || DEFAULT_CELL_SIZE).is_err());
+        assert!(resolve_window_size(80, 24, None, || (0, 20)).is_err());
+        assert!(resolve_window_size(u16::MAX, 24, None, || DEFAULT_CELL_SIZE).is_err());
+    }
+
+    #[test]
+    fn parses_cell_pixels_in_width_height_order() {
+        assert_eq!(parse_cell_size_reply(b"\x1b[6;19;9t"), Some((9, 19)));
+        assert_eq!(parse_cell_size_reply(b"noise\x1b[6;20;10t"), Some((10, 20)));
+    }
+
+    #[test]
+    fn rejects_window_pixels_and_invalid_cell_reports() {
+        for reply in [
+            b"\x1b[4;456;720t".as_slice(),
+            b"\x1b[6;19;9",
+            b"\x1b[6;0;9t",
+            b"\x1b[6;19;0t",
+            b"\x1b[6;19;65536t",
+            b"\x1b[6;19;9;1t",
+            b"\x1b[6;a;9t",
+        ] {
+            assert_eq!(parse_cell_size_reply(reply), None, "reply: {reply:?}");
+        }
+    }
 
     fn ws(rows: u16, cols: u16, cell_w: u16, cell_h: u16) -> WindowSize {
         WindowSize {
@@ -301,47 +516,4 @@ mod tests {
         assert_eq!(w.page_rows(), 0);
         assert!((w.page_area_height_px() - 0.0).abs() < f32::EPSILON);
     }
-}
-
-/// Draw the links overlay (numbered list).
-pub fn draw_links(
-    ws: &WindowSize,
-    links: &[crate::renderer::LinkInfo],
-    input: &str,
-    page_num: usize,
-) -> anyhow::Result<()> {
-    let cols = ws.cols as usize;
-
-    let title = format!(" Links on page {} ({} found)", page_num + 1, links.len());
-    execute!(
-        stdout(),
-        cursor::MoveTo(0, 0),
-        crossterm::style::SetAttribute(crossterm::style::Attribute::Reverse),
-        Print(format!("{:<width$}", title, width = cols)),
-        crossterm::style::SetAttribute(crossterm::style::Attribute::Reset),
-    )?;
-
-    if links.is_empty() {
-        execute!(
-            stdout(),
-            cursor::MoveTo(2, 2),
-            Print("No links on this page."),
-        )?;
-    } else {
-        for (i, link) in links.iter().enumerate() {
-            let row = (i + 2) as u16;
-            if row >= ws.page_rows().saturating_sub(1) {
-                break;
-            }
-            let line = format!("  {}: {}", i + 1, link.text);
-            let display: String = line.chars().take(cols).collect();
-            execute!(stdout(), cursor::MoveTo(0, row), Print(display))?;
-        }
-    }
-
-    let prompt_row = ws.page_rows().saturating_sub(1);
-    let prompt = format!("Enter number to follow (Esc to cancel): {input}");
-    execute!(stdout(), cursor::MoveTo(0, prompt_row), Print(prompt))?;
-
-    Ok(())
 }
