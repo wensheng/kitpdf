@@ -942,6 +942,68 @@ pub fn start_rendering(
     }
 }
 
+/// An open document rendered on demand for an embedded preview pane.
+pub(crate) struct PaneDocument {
+    doc: Document,
+    area: (f32, f32),
+    pub(crate) pages: usize,
+}
+
+impl PaneDocument {
+    /// Opens and lays out a preview document without loading saved viewer state.
+    ///
+    /// # Errors
+    /// Returns an error for unreadable, password-protected, or empty documents.
+    pub(crate) fn open(path: &Path, columns: u16, rows: u16) -> anyhow::Result<Self> {
+        let mut doc = open_document(path)?;
+        anyhow::ensure!(!doc.needs_password()?, "document requires a password");
+        // A stable 10x20 pixel cell gives readable previews without terminal queries.
+        // Placement uses explicit cell counts, so the host controls the actual size.
+        let mut area = (f32::from(columns) * 10.0, f32::from(rows) * 20.0);
+        if doc.is_reflowable()? {
+            let (w, h, em) = epub_layout_for_area(area.0, area.1, 10, 20);
+            doc.layout(w, h, em)?;
+        }
+        // Bound each raw RGB frame to 12 MB (16 MB after base64), below vfm's cap.
+        let scale = (4_000_000.0 / (area.0 * area.1)).sqrt().min(1.0);
+        area = (area.0 * scale, area.1 * scale);
+        let pages = usize::try_from(doc.page_count()?)?;
+        anyhow::ensure!(pages > 0, "document has no pages");
+        Ok(Self { doc, area, pages })
+    }
+
+    /// Renders a fitted page with the same pipeline as the standalone viewer.
+    ///
+    /// # Errors
+    /// Returns document, rasterization, or image conversion errors.
+    pub(crate) fn render(&self, index: usize) -> anyhow::Result<image::RgbImage> {
+        let page = self.doc.load_page(i32::try_from(index)?)?;
+        let bounds = page.bounds()?;
+        anyhow::ensure!(
+            bounds.width().is_finite()
+                && bounds.height().is_finite()
+                && bounds.width() > 0.0
+                && bounds.height() > 0.0,
+            "page has invalid dimensions"
+        );
+        let rendered = render_single_page(
+            &page,
+            None,
+            &PrevRender::default(),
+            false,
+            MUPDF_BLACK,
+            MUPDF_WHITE,
+            RotateDirection::Deg0,
+            self.area,
+            10,
+            20,
+        )?;
+        Ok(image_pipeline::image_from_rgb_data(copy_pixmap_rgb(
+            &rendered.pixmap,
+        )?)?)
+    }
+}
+
 pub struct ExportOptions<'a> {
     pub page_num: usize,
     pub output_dir: &'a Path,

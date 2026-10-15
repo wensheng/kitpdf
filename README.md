@@ -52,6 +52,7 @@ kitpdf [options] <file.pdf|epub>
 | `-w`, `--white-color <color>` | Custom white colour (CSS colour string) |
 | `-h`, `--help` | Show usage and exit |
 | `--version` | Print version and exit |
+| `--preview FILE W H` | Stream an embedded preview with W columns and H rows |
 
 ### Examples
 
@@ -64,6 +65,31 @@ kitpdf -b '#1a1a2e' -w '#e0e0e0' book.epub
 ```
 
 ## Features
+
+### File manager preview mode
+
+`kitpdf --preview FILE WIDTH HEIGHT` emits Kitty graphics to stdout without
+entering an alternate screen, changing terminal modes, probing the terminal,
+or loading/saving reading position. Use it with vfm's `[preview] kitpdf = true`
+plugin (or a graphics previewer rule with `interactive = true`). This mode
+must be the first option and takes exactly those three arguments; it is
+separate from the standalone viewer's display options.
+
+The first page appears immediately. Send `next`, `prev`, `first`, or `last`,
+each followed by a newline, on stdin to change pages. Boundaries are clamped;
+unknown commands are ignored. EOF exits. A host should terminate the child
+when switching files or resizing and restart it with the new pane size.
+
+Pages use direct, chunked RGB transfer with explicit cell placement, quiet
+replies (`q=2`) and no cursor movement (`C=1`). The host positions the cursor
+at the pane origin before each frame, deletes the previous image id after
+displaying the new frame, and deletes the final image on close. EPUB layout
+and image fitting use a 10×20 pixel cell estimate; no terminal query is needed
+through the pipes. Pane dimensions accept 1–500 cells, and raster memory is
+bounded to approximately four million pixels per page. Errors are returned
+as plain stdout text for hosts that display a failed previewer's output.
+
+### Standalone viewer
 
 - **PDF and EPUB support** via MuPDF
 - **Sharp zoom** — pages re-render at higher resolution, not just pixel scaling

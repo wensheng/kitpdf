@@ -10,6 +10,7 @@ mod export;
 mod image_pipeline;
 mod kitty;
 mod perf;
+mod preview;
 mod renderer;
 mod state;
 mod terminal;
@@ -159,6 +160,19 @@ fn horizontal_action(key: KeyCode, zoom_mode: bool) -> Option<HorizontalAction> 
 // ---------------------------------------------------------------------------
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--preview")
+    {
+        // Piped mode owns neither the terminal nor the standalone viewer state.
+        let result = preview::run(std::env::args_os().skip(2).collect());
+        if let Err(error) = &result {
+            // vfm displays plain stdout when the previewer produces no image.
+            use std::io::Write as _;
+            let _ = writeln!(stdout().lock(), "kitpdf: {error:#}");
+        }
+        return result;
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(3)
         .enable_all()
@@ -1767,6 +1781,7 @@ ARGUMENTS:
 OPTIONS:
     -p, --page <N>            Start on page N (1-indexed; ignores saved page)
     -e, --export              Export one page to PNG and exit
+        --preview FILE W H    Embedded graphics preview; page commands on stdin
     -i, --invert              Start with inverted colours
     -b, --black-color <css>   Custom black colour (e.g. '#1a1a2e')
     -w, --white-color <css>   Custom white colour (e.g. '#e0e0e0')

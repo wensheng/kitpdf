@@ -1088,11 +1088,18 @@ version = "0.8.0"
 dependencies = [
  "bitflags 2.11.1",
  "font-kit",
+ "mupdf-fonts-sil",
  "mupdf-sys",
  "once_cell",
  "percent-encoding",
  "zerocopy",
 ]
+
+[[package]]
+name = "mupdf-fonts-sil"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "511cf7073836b0c27eacbf32332b071d5f714fe1416d1ca62930731ce51ddc7f"
 
 [[package]]
 name = "mupdf-sys"
